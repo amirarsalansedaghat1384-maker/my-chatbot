@@ -111,6 +111,50 @@
     .chat-input button:hover {
         background: #5636d6;
     }
+    .attach-btn {
+        background: #eee;
+        color: #6c47ff;
+        border: none;
+        width: 40px;
+        height: 40px;
+        border-radius: 50%;
+        cursor: pointer;
+        font-size: 18px;
+        flex-shrink: 0;
+    }
+    .attach-btn:hover {
+        background: #e2e2e2;
+    }
+    .image-preview-bar {
+        display: none;
+        align-items: center;
+        gap: 8px;
+        padding: 8px 12px;
+        border-top: 1px solid #ddd;
+        background: #f8f8f8;
+    }
+    .image-preview-bar.show {
+        display: flex;
+    }
+    .image-preview-bar img {
+        height: 50px;
+        border-radius: 8px;
+    }
+    .image-preview-bar .remove-img {
+        border: none;
+        background: #eee;
+        border-radius: 50%;
+        width: 24px;
+        height: 24px;
+        cursor: pointer;
+        font-size: 13px;
+    }
+    .msg-image {
+        max-width: 100%;
+        border-radius: 10px;
+        margin-bottom: 6px;
+        display: block;
+    }
     .loading {
         align-self: flex-end;
         color: #999;
@@ -204,7 +248,14 @@
         <button class="header-btn" onclick="startNewChat()">➕ چت جدید</button>
     </div>
     <div class="chat-messages" id="messages"></div>
+    <div class="image-preview-bar" id="imagePreviewBar">
+        <img id="imagePreviewImg" src="" alt="پیش‌نمایش">
+        <span style="font-size:12px;color:#666;">عکس آماده ارسال</span>
+        <button class="remove-img" onclick="removeSelectedImage()">✕</button>
+    </div>
     <div class="chat-input">
+        <button class="attach-btn" onclick="document.getElementById('imageInput').click()">📎</button>
+        <input type="file" id="imageInput" accept="image/*" style="display:none" onchange="handleImageSelect(event)">
         <input type="text" id="userInput" placeholder="پیامتو بنویس..." onkeypress="if(event.key==='Enter') sendMessage()">
         <button onclick="sendMessage()">ارسال</button>
     </div>
@@ -222,14 +273,55 @@
 
 <script>
 let currentChatId = localStorage.getItem('currentChatId') || null;
+let selectedImageData = null; // data URL عکس انتخاب‌شده
 
-function addMessage(text, role) {
+function addMessage(content, role) {
     const messagesDiv = document.getElementById('messages');
     const el = document.createElement('div');
     el.className = 'message ' + role;
-    el.textContent = text;
+
+    // content می‌تونه رشته ساده باشه یا آرایه‌ای شامل متن و عکس
+    if (Array.isArray(content)) {
+        let textPart = '';
+        content.forEach(part => {
+            if (part.type === 'image_url') {
+                const img = document.createElement('img');
+                img.src = part.image_url.url;
+                img.className = 'msg-image';
+                el.appendChild(img);
+            } else if (part.type === 'text') {
+                textPart = part.text;
+            }
+        });
+        if (textPart) {
+            const textNode = document.createElement('div');
+            textNode.textContent = textPart;
+            el.appendChild(textNode);
+        }
+    } else {
+        el.textContent = content;
+    }
+
     messagesDiv.appendChild(el);
     messagesDiv.scrollTop = messagesDiv.scrollHeight;
+}
+
+function handleImageSelect(event) {
+    const file = event.target.files[0];
+    if (!file) return;
+    const reader = new FileReader();
+    reader.onload = () => {
+        selectedImageData = reader.result;
+        document.getElementById('imagePreviewImg').src = selectedImageData;
+        document.getElementById('imagePreviewBar').classList.add('show');
+    };
+    reader.readAsDataURL(file);
+}
+
+function removeSelectedImage() {
+    selectedImageData = null;
+    document.getElementById('imageInput').value = '';
+    document.getElementById('imagePreviewBar').classList.remove('show');
 }
 
 function clearMessagesView() {
@@ -240,10 +332,21 @@ async function sendMessage() {
     const input = document.getElementById('userInput');
     const messagesDiv = document.getElementById('messages');
     const text = input.value.trim();
-    if (!text) return;
+    if (!text && !selectedImageData) return;
 
-    addMessage(text, 'user');
+    // نمایش پیام کاربر (متن + عکس اگه بود)
+    if (selectedImageData) {
+        addMessage([
+            {type: 'image_url', image_url: {url: selectedImageData}},
+            {type: 'text', text: text}
+        ], 'user');
+    } else {
+        addMessage(text, 'user');
+    }
+
+    const imageToSend = selectedImageData;
     input.value = '';
+    removeSelectedImage();
 
     const loadingEl = document.createElement('div');
     loadingEl.className = 'loading';
@@ -255,7 +358,7 @@ async function sendMessage() {
         const res = await fetch('/chat', {
             method: 'POST',
             headers: {'Content-Type': 'application/json'},
-            body: JSON.stringify({message: text, chat_id: currentChatId})
+            body: JSON.stringify({message: text, chat_id: currentChatId, image: imageToSend})
         });
         const data = await res.json();
         loadingEl.remove();
