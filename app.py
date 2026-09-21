@@ -12,7 +12,7 @@ import time
 
 app = Flask(__name__)
 
-API_KEY = os.environ.get("OPENROUTER_API_KEY", "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")
+API_KEY = os.environ.get("OPENROUTER_API_KEY")
 
 API_URL = "https://openrouter.ai/api/v1/chat/completions"
 MODEL = "openrouter/free"
