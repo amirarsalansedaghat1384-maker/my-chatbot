@@ -12,7 +12,7 @@ import time
 
 app = Flask(__name__)
 
-API_KEY = os.environ.get("OPENROUTER_API_KEY")
+API_KEY = os.environ.get("OPENROUTER_API_KEY", "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")
 
 API_URL = "https://openrouter.ai/api/v1/chat/completions"
 MODEL = "openrouter/free"
@@ -98,8 +98,9 @@ def delete_chat(chat_id):
 def chat():
     chat_id = request.json.get("chat_id")
     user_message = request.json.get("message", "").strip()
+    image_data = request.json.get("image")  # data URL مثل: data:image/jpeg;base64,....
 
-    if not user_message:
+    if not user_message and not image_data:
         return jsonify({"error": "پیام خالی است"}), 400
 
     if not chat_id or chat_id not in data_store["chats"]:
@@ -115,9 +116,19 @@ def chat():
 
     # اگه اولین پیام این مکالمه‌ست، عنوانشو از روش بساز
     if len(chat_obj["messages"]) == 0:
-        chat_obj["title"] = make_title(user_message)
+        chat_obj["title"] = make_title(user_message or "تصویر")
 
-    chat_obj["messages"].append({"role": "user", "content": user_message})
+    # ساخت محتوای پیام - اگه عکس داشت، به فرمت چندبخشی (متن + عکس) می‌سازیم
+    if image_data:
+        text_part = user_message or "این تصویر رو توضیح بده"
+        content = [
+            {"type": "text", "text": text_part},
+            {"type": "image_url", "image_url": {"url": image_data}},
+        ]
+    else:
+        content = user_message
+
+    chat_obj["messages"].append({"role": "user", "content": content})
     save_data(data_store)
 
     try:
