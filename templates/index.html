@@ -3,24 +3,65 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
+<link rel="manifest" href="/static/manifest.json">
+<meta name="theme-color" content="#6c47ff">
+<link rel="apple-touch-icon" href="/static/icon-192.png">
+<meta name="mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
 <title>چت‌بات من</title>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/marked/9.1.6/marked.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/dompurify/3.0.6/purify.min.js"></script>
 <style>
     * { box-sizing: border-box; }
+    :root {
+        --bg-outer: #f0f2f5;
+        --bg-card: #ffffff;
+        --header-bg: #6c47ff;
+        --header-text: #ffffff;
+        --user-bg: #6c47ff;
+        --user-text: #ffffff;
+        --assistant-bg: #e9e9eb;
+        --assistant-text: #333333;
+        --input-border: #cccccc;
+        --input-bg: #ffffff;
+        --input-text: #222222;
+        --sidebar-bg: #ffffff;
+        --sidebar-hover: #f5f3ff;
+        --muted-text: #999999;
+    }
+    body.dark {
+        --bg-outer: #14141a;
+        --bg-card: #1e1e26;
+        --header-bg: #4a2fc9;
+        --header-text: #ffffff;
+        --user-bg: #4a2fc9;
+        --user-text: #ffffff;
+        --assistant-bg: #2a2a34;
+        --assistant-text: #e4e4e8;
+        --input-border: #3a3a46;
+        --input-bg: #26262f;
+        --input-text: #e4e4e8;
+        --sidebar-bg: #1e1e26;
+        --sidebar-hover: #2a2a3a;
+        --muted-text: #888888;
+    }
     body {
         font-family: 'Tahoma', 'Segoe UI', sans-serif;
-        background: #f0f2f5;
+        background: var(--bg-outer);
         margin: 0;
         padding: 0;
         display: flex;
         justify-content: center;
         align-items: center;
         height: 100vh;
+        transition: background 0.2s ease;
     }
     .app-container {
         width: 100%;
         max-width: 600px;
         height: 90vh;
-        background: white;
+        background: var(--bg-card);
         border-radius: 12px;
         box-shadow: 0 4px 20px rgba(0,0,0,0.1);
         display: flex;
@@ -29,9 +70,14 @@
         position: relative;
     }
     .chat-header {
-        background: #6c47ff;
-        color: white;
-        padding: 12px 16px;
+        background: var(--header-bg);
+        color: var(--header-text);
+        padding: 10px 16px;
+        display: flex;
+        flex-direction: column;
+        gap: 6px;
+    }
+    .chat-header-row {
         display: flex;
         justify-content: space-between;
         align-items: center;
@@ -44,6 +90,11 @@
         text-overflow: ellipsis;
         white-space: nowrap;
         flex: 1;
+    }
+    .usage-bar {
+        font-size: 11px;
+        color: rgba(255,255,255,0.85);
+        text-align: center;
     }
     .header-btn {
         background: rgba(255,255,255,0.2);
@@ -72,34 +123,78 @@
         border-radius: 14px;
         line-height: 1.5;
         white-space: pre-wrap;
+        position: relative;
     }
     .user {
-        background: #6c47ff;
-        color: white;
+        background: var(--user-bg);
+        color: var(--user-text);
         align-self: flex-start;
         border-bottom-left-radius: 4px;
     }
     .assistant {
-        background: #e9e9eb;
-        color: #333;
+        background: var(--assistant-bg);
+        color: var(--assistant-text);
         align-self: flex-end;
         border-bottom-right-radius: 4px;
+        padding-bottom: 28px;
     }
+    .assistant p { margin: 0 0 8px 0; }
+    .assistant p:last-child { margin-bottom: 0; }
+    .assistant ul, .assistant ol { margin: 4px 0; padding-inline-start: 20px; }
+    .assistant strong { color: #8a6fff; }
+    .assistant code {
+        background: rgba(0,0,0,0.15);
+        padding: 1px 5px;
+        border-radius: 4px;
+        font-size: 13px;
+    }
+    .assistant pre {
+        background: rgba(0,0,0,0.15);
+        padding: 8px;
+        border-radius: 8px;
+        overflow-x: auto;
+        direction: ltr;
+        text-align: left;
+    }
+    .copy-btn {
+        position: absolute;
+        bottom: 6px;
+        left: 10px;
+        background: none;
+        border: none;
+        color: var(--muted-text);
+        font-size: 12px;
+        cursor: pointer;
+        padding: 2px 6px;
+    }
+    .copy-btn:hover { color: #8a6fff; }
+    .cursor-blink {
+        display: inline-block;
+        width: 6px;
+        height: 14px;
+        background: #8a6fff;
+        margin-inline-start: 2px;
+        animation: blink 0.9s infinite;
+        vertical-align: middle;
+    }
+    @keyframes blink { 50% { opacity: 0; } }
     .chat-input {
         display: flex;
         padding: 12px;
-        border-top: 1px solid #ddd;
+        border-top: 1px solid var(--input-border);
         gap: 8px;
     }
     .chat-input input {
         flex: 1;
         padding: 10px 14px;
         border-radius: 20px;
-        border: 1px solid #ccc;
+        border: 1px solid var(--input-border);
+        background: var(--input-bg);
+        color: var(--input-text);
         font-size: 15px;
         outline: none;
     }
-    .chat-input button {
+    .chat-input button.send-btn {
         background: #6c47ff;
         color: white;
         border: none;
@@ -108,11 +203,11 @@
         cursor: pointer;
         font-size: 15px;
     }
-    .chat-input button:hover {
+    .chat-input button.send-btn:hover {
         background: #5636d6;
     }
-    .attach-btn {
-        background: #eee;
+    .attach-btn, .mic-btn {
+        background: var(--assistant-bg);
         color: #6c47ff;
         border: none;
         width: 40px;
@@ -122,16 +217,26 @@
         font-size: 18px;
         flex-shrink: 0;
     }
-    .attach-btn:hover {
-        background: #e2e2e2;
+    .attach-btn:hover, .mic-btn:hover {
+        opacity: 0.8;
+    }
+    .mic-btn.recording {
+        background: #ff4757;
+        color: white;
+        animation: pulse 1s infinite;
+    }
+    @keyframes pulse {
+        0% { box-shadow: 0 0 0 0 rgba(255,71,87,0.5); }
+        70% { box-shadow: 0 0 0 8px rgba(255,71,87,0); }
+        100% { box-shadow: 0 0 0 0 rgba(255,71,87,0); }
     }
     .image-preview-bar {
         display: none;
         align-items: center;
         gap: 8px;
         padding: 8px 12px;
-        border-top: 1px solid #ddd;
-        background: #f8f8f8;
+        border-top: 1px solid var(--input-border);
+        background: var(--assistant-bg);
     }
     .image-preview-bar.show {
         display: flex;
@@ -142,7 +247,7 @@
     }
     .image-preview-bar .remove-img {
         border: none;
-        background: #eee;
+        background: var(--bg-card);
         border-radius: 50%;
         width: 24px;
         height: 24px;
@@ -157,12 +262,12 @@
     }
     .loading {
         align-self: flex-end;
-        color: #999;
+        color: var(--muted-text);
         font-size: 13px;
     }
     .empty-state {
         margin: auto;
-        color: #999;
+        color: var(--muted-text);
         text-align: center;
         font-size: 14px;
     }
@@ -181,7 +286,7 @@
         top: 0; right: 0; bottom: 0;
         width: 78%;
         max-width: 300px;
-        background: white;
+        background: var(--sidebar-bg);
         transform: translateX(100%);
         transition: transform 0.2s ease;
         display: flex;
@@ -192,10 +297,25 @@
     .sidebar-header {
         padding: 16px;
         font-weight: bold;
-        border-bottom: 1px solid #eee;
+        border-bottom: 1px solid rgba(128,128,128,0.2);
         display: flex;
         justify-content: space-between;
         align-items: center;
+        color: var(--input-text);
+    }
+    .sidebar-search {
+        padding: 8px 12px;
+        border-bottom: 1px solid rgba(128,128,128,0.15);
+    }
+    .sidebar-search input {
+        width: 100%;
+        padding: 8px 12px;
+        border-radius: 8px;
+        border: 1px solid var(--input-border);
+        background: var(--input-bg);
+        color: var(--input-text);
+        font-size: 13px;
+        outline: none;
     }
     .sidebar-list {
         flex: 1;
@@ -203,15 +323,16 @@
     }
     .chat-item {
         padding: 12px 16px;
-        border-bottom: 1px solid #f0f0f0;
+        border-bottom: 1px solid rgba(128,128,128,0.15);
         cursor: pointer;
         display: flex;
         justify-content: space-between;
         align-items: center;
-        gap: 8px;
+        gap: 4px;
+        color: var(--input-text);
     }
     .chat-item:hover, .chat-item.active {
-        background: #f5f3ff;
+        background: var(--sidebar-hover);
     }
     .chat-item-title {
         overflow: hidden;
@@ -219,14 +340,15 @@
         white-space: nowrap;
         flex: 1;
     }
-    .delete-chat-btn {
+    .rename-chat-btn, .delete-chat-btn {
         border: none;
         background: none;
-        color: #c00;
         font-size: 14px;
         cursor: pointer;
-        padding: 4px 8px;
+        padding: 4px 6px;
+        flex-shrink: 0;
     }
+    .delete-chat-btn { color: #c00; }
     .new-chat-btn-sidebar {
         margin: 12px;
         padding: 10px;
@@ -243,21 +365,26 @@
 
 <div class="app-container">
     <div class="chat-header">
-        <button class="header-btn" onclick="toggleSidebar(true)">☰ مکالمات</button>
-        <div class="chat-title" id="chatTitle">مکالمه جدید</div>
-        <button class="header-btn" onclick="startNewChat()">➕ چت جدید</button>
+        <div class="chat-header-row">
+            <button class="header-btn" onclick="toggleSidebar(true)">☰ مکالمات</button>
+            <div class="chat-title" id="chatTitle">مکالمه جدید</div>
+            <button class="header-btn" id="darkModeBtn" onclick="toggleDarkMode()">🌙</button>
+            <button class="header-btn" onclick="startNewChat()">➕ چت جدید</button>
+        </div>
+        <div class="usage-bar" id="usageBar"></div>
     </div>
     <div class="chat-messages" id="messages"></div>
     <div class="image-preview-bar" id="imagePreviewBar">
         <img id="imagePreviewImg" src="" alt="پیش‌نمایش">
-        <span style="font-size:12px;color:#666;">عکس آماده ارسال</span>
+        <span style="font-size:12px;color:var(--muted-text);">عکس آماده ارسال</span>
         <button class="remove-img" onclick="removeSelectedImage()">✕</button>
     </div>
     <div class="chat-input">
         <button class="attach-btn" onclick="document.getElementById('imageInput').click()">📎</button>
         <input type="file" id="imageInput" accept="image/*" style="display:none" onchange="handleImageSelect(event)">
+        <button class="mic-btn" id="micBtn" onclick="toggleVoiceInput()">🎤</button>
         <input type="text" id="userInput" placeholder="پیامتو بنویس..." onkeypress="if(event.key==='Enter') sendMessage()">
-        <button onclick="sendMessage()">ارسال</button>
+        <button class="send-btn" onclick="sendMessage()">ارسال</button>
     </div>
 
     <div class="sidebar-overlay" id="sidebarOverlay" onclick="toggleSidebar(false)"></div>
@@ -265,6 +392,9 @@
         <div class="sidebar-header">
             <span>مکالمات قبلی</span>
             <button class="header-btn" onclick="toggleSidebar(false)">✕</button>
+        </div>
+        <div class="sidebar-search">
+            <input type="text" id="searchInput" placeholder="🔍 جستجو در مکالمات..." oninput="handleSearchInput()">
         </div>
         <button class="new-chat-btn-sidebar" onclick="startNewChat()">➕ مکالمه جدید</button>
         <div class="sidebar-list" id="chatList"></div>
@@ -274,13 +404,96 @@
 <script>
 let currentChatId = localStorage.getItem('currentChatId') || null;
 let selectedImageData = null; // data URL عکس انتخاب‌شده
+let searchDebounceTimer = null;
+let recognition = null;
+let isRecording = false;
+
+function initDarkMode() {
+    const isDark = localStorage.getItem('darkMode') === 'true';
+    document.body.classList.toggle('dark', isDark);
+    document.getElementById('darkModeBtn').textContent = isDark ? '☀️' : '🌙';
+}
+
+function toggleDarkMode() {
+    const isDark = document.body.classList.toggle('dark');
+    localStorage.setItem('darkMode', isDark);
+    document.getElementById('darkModeBtn').textContent = isDark ? '☀️' : '🌙';
+}
+initDarkMode();
+
+// ثبت سرویس‌ورکر برای فعال شدن قابلیت نصب PWA
+if ('serviceWorker' in navigator) {
+    window.addEventListener('load', () => {
+        navigator.serviceWorker.register('/static/service-worker.js').catch(() => {});
+    });
+}
+
+// ---------- ورودی صوتی ----------
+function setupVoiceRecognition() {
+    const SpeechRecognition = window.SpeechRecognition || window.webkitSpeechRecognition;
+    if (!SpeechRecognition) {
+        document.getElementById('micBtn').style.display = 'none';
+        return;
+    }
+    recognition = new SpeechRecognition();
+    recognition.lang = 'fa-IR';
+    recognition.interimResults = false;
+    recognition.maxAlternatives = 1;
+
+    recognition.onresult = (event) => {
+        const transcript = event.results[0][0].transcript;
+        const input = document.getElementById('userInput');
+        input.value = (input.value ? input.value + ' ' : '') + transcript;
+    };
+    recognition.onend = () => {
+        isRecording = false;
+        document.getElementById('micBtn').classList.remove('recording');
+    };
+    recognition.onerror = () => {
+        isRecording = false;
+        document.getElementById('micBtn').classList.remove('recording');
+    };
+}
+setupVoiceRecognition();
+
+function toggleVoiceInput() {
+    if (!recognition) return;
+    if (isRecording) {
+        recognition.stop();
+        isRecording = false;
+        document.getElementById('micBtn').classList.remove('recording');
+    } else {
+        recognition.start();
+        isRecording = true;
+        document.getElementById('micBtn').classList.add('recording');
+    }
+}
+
+// ---------- محدودیت استفاده روزانه ----------
+async function refreshUsage() {
+    try {
+        const res = await fetch('/usage');
+        const data = await res.json();
+        document.getElementById('usageBar').textContent =
+            `پیام‌های امروز: ${data.used} از ${data.limit}`;
+    } catch (e) {}
+}
+
+// ---------- رندر مارک‌داون ----------
+function renderMarkdown(text) {
+    try {
+        const rawHtml = marked.parse(text);
+        return DOMPurify.sanitize(rawHtml);
+    } catch (e) {
+        return text;
+    }
+}
 
 function addMessage(content, role) {
     const messagesDiv = document.getElementById('messages');
     const el = document.createElement('div');
     el.className = 'message ' + role;
 
-    // content می‌تونه رشته ساده باشه یا آرایه‌ای شامل متن و عکس
     if (Array.isArray(content)) {
         let textPart = '';
         content.forEach(part => {
@@ -298,12 +511,29 @@ function addMessage(content, role) {
             textNode.textContent = textPart;
             el.appendChild(textNode);
         }
+    } else if (role === 'assistant') {
+        el.innerHTML = renderMarkdown(content);
+        addCopyButton(el, content);
     } else {
         el.textContent = content;
     }
 
     messagesDiv.appendChild(el);
     messagesDiv.scrollTop = messagesDiv.scrollHeight;
+    return el;
+}
+
+function addCopyButton(el, text) {
+    const copyBtn = document.createElement('button');
+    copyBtn.className = 'copy-btn';
+    copyBtn.textContent = '📋 کپی';
+    copyBtn.onclick = () => {
+        navigator.clipboard.writeText(text).then(() => {
+            copyBtn.textContent = '✅ کپی شد';
+            setTimeout(() => { copyBtn.textContent = '📋 کپی'; }, 1500);
+        });
+    };
+    el.appendChild(copyBtn);
 }
 
 function handleImageSelect(event) {
@@ -328,13 +558,13 @@ function clearMessagesView() {
     document.getElementById('messages').innerHTML = '';
 }
 
+// ---------- ارسال پیام با پاسخ استریم (تایپ‌شونده) ----------
 async function sendMessage() {
     const input = document.getElementById('userInput');
     const messagesDiv = document.getElementById('messages');
     const text = input.value.trim();
     if (!text && !selectedImageData) return;
 
-    // نمایش پیام کاربر (متن + عکس اگه بود)
     if (selectedImageData) {
         addMessage([
             {type: 'image_url', image_url: {url: selectedImageData}},
@@ -348,34 +578,81 @@ async function sendMessage() {
     input.value = '';
     removeSelectedImage();
 
-    const loadingEl = document.createElement('div');
-    loadingEl.className = 'loading';
-    loadingEl.textContent = 'در حال تایپ...';
-    messagesDiv.appendChild(loadingEl);
+    // حباب خالی دستیار که به‌مرور پر می‌شه
+    const assistantEl = document.createElement('div');
+    assistantEl.className = 'message assistant';
+    const cursor = document.createElement('span');
+    cursor.className = 'cursor-blink';
+    assistantEl.appendChild(cursor);
+    messagesDiv.appendChild(assistantEl);
     messagesDiv.scrollTop = messagesDiv.scrollHeight;
 
+    let fullText = '';
+
     try {
-        const res = await fetch('/chat', {
+        const res = await fetch('/chat/stream', {
             method: 'POST',
             headers: {'Content-Type': 'application/json'},
             body: JSON.stringify({message: text, chat_id: currentChatId, image: imageToSend})
         });
-        const data = await res.json();
-        loadingEl.remove();
 
-        if (data.error) {
-            addMessage('خطا: ' + data.error, 'assistant');
-        } else {
-            addMessage(data.reply, 'assistant');
-            if (data.chat_id && data.chat_id !== currentChatId) {
-                currentChatId = data.chat_id;
-                localStorage.setItem('currentChatId', currentChatId);
-            }
-            refreshChatList();
+        if (!res.ok) {
+            const errData = await res.json().catch(() => ({}));
+            assistantEl.textContent = 'خطا: ' + (errData.error || 'مشکلی پیش اومد');
+            refreshUsage();
+            return;
         }
+
+        const reader = res.body.getReader();
+        const decoder = new TextDecoder();
+        let buffer = '';
+
+        while (true) {
+            const { done, value } = await reader.read();
+            if (done) break;
+            buffer += decoder.decode(value, { stream: true });
+
+            const parts = buffer.split('\n\n');
+            buffer = parts.pop(); // تکه‌ی ناقص آخر رو نگه دار برای دفعه بعد
+
+            for (const part of parts) {
+                if (!part.startsWith('data: ')) continue;
+                const jsonStr = part.slice(6).trim();
+                if (!jsonStr) continue;
+                let payload;
+                try {
+                    payload = JSON.parse(jsonStr);
+                } catch (e) {
+                    continue;
+                }
+
+                if (payload.delta) {
+                    fullText += payload.delta;
+                    assistantEl.innerHTML = renderMarkdown(fullText);
+                    assistantEl.appendChild(cursor);
+                    messagesDiv.scrollTop = messagesDiv.scrollHeight;
+                } else if (payload.error) {
+                    assistantEl.innerHTML = renderMarkdown(fullText || ('خطا: ' + payload.error));
+                } else if (payload.done) {
+                    if (payload.chat_id && payload.chat_id !== currentChatId) {
+                        currentChatId = payload.chat_id;
+                        localStorage.setItem('currentChatId', currentChatId);
+                    }
+                }
+            }
+        }
+
+        cursor.remove();
+        if (fullText) {
+            assistantEl.innerHTML = renderMarkdown(fullText);
+            addCopyButton(assistantEl, fullText);
+        }
+        refreshChatList();
+        refreshUsage();
+
     } catch (err) {
-        loadingEl.remove();
-        addMessage('خطا در ارتباط با سرور', 'assistant');
+        cursor.remove();
+        assistantEl.textContent = 'خطا در ارتباط با سرور';
     }
 }
 
@@ -415,18 +692,28 @@ async function deleteChat(chatId, event) {
     refreshChatList();
 }
 
-async function refreshChatList() {
-    const res = await fetch('/chats');
-    const data = await res.json();
+async function renameChat(chatId, currentTitle, event) {
+    event.stopPropagation();
+    const newTitle = prompt('اسم جدید مکالمه:', currentTitle);
+    if (!newTitle || !newTitle.trim() || newTitle.trim() === currentTitle) return;
+    await fetch('/chats/' + chatId + '/rename', {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({title: newTitle.trim()})
+    });
+    refreshChatList();
+}
+
+function renderChatItems(chats) {
     const listEl = document.getElementById('chatList');
     listEl.innerHTML = '';
 
-    if (data.chats.length === 0) {
-        listEl.innerHTML = '<div style="padding:16px;color:#999;font-size:13px;">هنوز مکالمه‌ای نیست</div>';
+    if (chats.length === 0) {
+        listEl.innerHTML = '<div style="padding:16px;color:var(--muted-text);font-size:13px;">چیزی پیدا نشد</div>';
         return;
     }
 
-    data.chats.forEach(c => {
+    chats.forEach(c => {
         const item = document.createElement('div');
         item.className = 'chat-item' + (c.id === currentChatId ? ' active' : '');
         item.onclick = () => switchToChat(c.id);
@@ -435,12 +722,18 @@ async function refreshChatList() {
         titleSpan.className = 'chat-item-title';
         titleSpan.textContent = c.title;
 
+        const renameBtn = document.createElement('button');
+        renameBtn.className = 'rename-chat-btn';
+        renameBtn.textContent = '✏️';
+        renameBtn.onclick = (e) => renameChat(c.id, c.title, e);
+
         const delBtn = document.createElement('button');
         delBtn.className = 'delete-chat-btn';
         delBtn.textContent = '🗑️';
         delBtn.onclick = (e) => deleteChat(c.id, e);
 
         item.appendChild(titleSpan);
+        item.appendChild(renameBtn);
         item.appendChild(delBtn);
         listEl.appendChild(item);
 
@@ -450,6 +743,26 @@ async function refreshChatList() {
     });
 }
 
+async function refreshChatList() {
+    const res = await fetch('/chats');
+    const data = await res.json();
+    renderChatItems(data.chats);
+}
+
+function handleSearchInput() {
+    clearTimeout(searchDebounceTimer);
+    const query = document.getElementById('searchInput').value.trim();
+    searchDebounceTimer = setTimeout(async () => {
+        if (!query) {
+            refreshChatList();
+            return;
+        }
+        const res = await fetch('/chats/search?q=' + encodeURIComponent(query));
+        const data = await res.json();
+        renderChatItems(data.chats);
+    }, 300);
+}
+
 function toggleSidebar(open) {
     document.getElementById('sidebar').classList.toggle('open', open);
     document.getElementById('sidebarOverlay').classList.toggle('open', open);
@@ -457,6 +770,7 @@ function toggleSidebar(open) {
 
 async function init() {
     await refreshChatList();
+    refreshUsage();
     if (currentChatId) {
         const res = await fetch('/chats/' + currentChatId);
         if (res.ok) {
@@ -465,7 +779,6 @@ async function init() {
             return;
         }
     }
-    // اگه چت فعالی نبود، یکی جدید بساز
     startNewChat();
 }
 
