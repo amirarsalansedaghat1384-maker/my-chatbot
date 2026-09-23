@@ -1,14 +1,16 @@
 """
-یک چت‌بات ساده با استفاده از Flask و OpenRouter API
-با قابلیت چند مکالمه جداگانه و ذخیره دائمی تاریخچه
+چت‌بات فارسی با Flask و OpenRouter
+قابلیت‌ها: چند مکالمه، ذخیره دائمی، جدا بودن کاربران، آپلود عکس،
+محدودیت پیام روزانه، پاسخ استریم (تایپ‌شونده)، جستجو در تاریخچه
 """
 
-from flask import Flask, render_template, request, jsonify
+from flask import Flask, render_template, request, jsonify, g, Response
 import requests
 import os
 import json
 import uuid
 import time
+import datetime
 
 app = Flask(__name__)
 
@@ -17,22 +19,32 @@ API_KEY = os.environ.get("OPENROUTER_API_KEY")
 API_URL = "https://openrouter.ai/api/v1/chat/completions"
 MODEL = "openrouter/free"
 
+SYSTEM_PROMPT = (
+    "تو یک دستیار هوش مصنوعی فارسی‌زبان هستی. همیشه فقط و فقط به زبان فارسی روان و "
+    "طبیعی پاسخ بده و هیچ کلمه یا جمله‌ای از زبان‌های دیگر (انگلیسی، اسپانیایی، رومانیایی و غیره) "
+    "قاطی جواب‌هات نکن، مگر اینکه کاربر مستقیم از تو بخواد یا اسم خاص/فنی باشه که معادل فارسی نداره. "
+    "برای فرمت‌بندی جواب‌هات از Markdown استاندارد استفاده کن: **متن پررنگ** برای تاکید، "
+    "لیست‌ها با - یا شماره، و تیترها در صورت نیاز. جواب‌هات رو تمیز، خوانا و مرتب بنویس."
+)
+
 HISTORY_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "chat_history.json")
+
+COOKIE_NAME = "user_id"
+COOKIE_MAX_AGE = 60 * 60 * 24 * 365 * 2  # دو سال
+
+MAX_DAILY_MESSAGES = 30  # محدودیت پیام رایگان روزانه برای هر کاربر
 
 
 def load_data():
-    """ساختار داده: {"chats": {chat_id: {"title": ..., "messages": [...], "created": ...}}}"""
     if os.path.exists(HISTORY_FILE):
         try:
             with open(HISTORY_FILE, "r", encoding="utf-8") as f:
                 data = json.load(f)
-                if "chats" in data:
+                if "users" in data:
                     return data
         except (json.JSONDecodeError, IOError):
             pass
-
-    # اگه فایل قدیمی (فقط لیست پیام) بود یا فایلی نبود، یه چت جدید بساز
-    return {"chats": {}}
+    return {"users": {}}
 
 
 def save_data(data):
@@ -43,6 +55,17 @@ def save_data(data):
 data_store = load_data()
 
 
+def get_user_entry():
+    user_id = g.user_id
+    if user_id not in data_store["users"]:
+        data_store["users"][user_id] = {"chats": {}}
+    return data_store["users"][user_id]
+
+
+def get_user_chats():
+    return get_user_entry()["chats"]
+
+
 def make_title(first_message):
     title = first_message.strip()
     if len(title) > 30:
@@ -50,26 +73,124 @@ def make_title(first_message):
     return title or "مکالمه جدید"
 
 
+def check_and_increment_usage():
+    """برمی‌گردونه: (مجاز است؟, پیام خطا در صورت رد شدن)"""
+    user_entry = get_user_entry()
+    today = datetime.date.today().isoformat()
+    usage = user_entry.setdefault("usage", {"date": today, "count": 0})
+    if usage["date"] != today:
+        usage["date"] = today
+        usage["count"] = 0
+    if usage["count"] >= MAX_DAILY_MESSAGES:
+        return False, f"محدودیت {MAX_DAILY_MESSAGES} پیام رایگان امروزت تموم شد. فردا دوباره امتحان کن."
+    usage["count"] += 1
+    return True, None
+
+
+def build_content(user_message, image_data):
+    if image_data:
+        text_part = user_message or "این تصویر رو توضیح بده"
+        return [
+            {"type": "text", "text": text_part},
+            {"type": "image_url", "image_url": {"url": image_data}},
+        ]
+    return user_message
+
+
+def prepare_chat(chat_id, user_chats, user_message):
+    if not chat_id or chat_id not in user_chats:
+        chat_id = str(uuid.uuid4())
+        user_chats[chat_id] = {
+            "title": "مکالمه جدید",
+            "messages": [],
+            "created": time.time(),
+        }
+    chat_obj = user_chats[chat_id]
+    if len(chat_obj["messages"]) == 0:
+        chat_obj["title"] = make_title(user_message or "تصویر")
+    return chat_id, chat_obj
+
+
+@app.before_request
+def ensure_user_id():
+    user_id = request.cookies.get(COOKIE_NAME)
+    if not user_id:
+        user_id = str(uuid.uuid4())
+        g.new_user_id = user_id
+    g.user_id = user_id
+
+
+@app.after_request
+def set_user_cookie(response):
+    if hasattr(g, "new_user_id"):
+        response.set_cookie(
+            COOKIE_NAME,
+            g.new_user_id,
+            max_age=COOKIE_MAX_AGE,
+            httponly=True,
+            samesite="Lax",
+        )
+    return response
+
+
 @app.route("/")
 def index():
     return render_template("index.html")
 
 
+@app.route("/usage", methods=["GET"])
+def usage_status():
+    user_entry = get_user_entry()
+    today = datetime.date.today().isoformat()
+    usage = user_entry.get("usage", {"date": today, "count": 0})
+    if usage["date"] != today:
+        usage = {"date": today, "count": 0}
+    return jsonify({"used": usage["count"], "limit": MAX_DAILY_MESSAGES})
+
+
 @app.route("/chats", methods=["GET"])
 def list_chats():
-    """لیست همه مکالمات، جدیدترین اول"""
+    user_chats = get_user_chats()
     chats = [
         {"id": cid, "title": c["title"], "created": c["created"]}
-        for cid, c in data_store["chats"].items()
+        for cid, c in user_chats.items()
     ]
     chats.sort(key=lambda c: c["created"], reverse=True)
     return jsonify({"chats": chats})
 
 
+@app.route("/chats/search", methods=["GET"])
+def search_chats():
+    query = request.args.get("q", "").strip()
+    user_chats = get_user_chats()
+    if not query:
+        return jsonify({"chats": []})
+
+    results = []
+    for cid, c in user_chats.items():
+        found = query in c["title"]
+        if not found:
+            for m in c["messages"]:
+                content = m["content"]
+                if isinstance(content, str):
+                    text = content
+                else:
+                    text = " ".join(p.get("text", "") for p in content if p.get("type") == "text")
+                if query in text:
+                    found = True
+                    break
+        if found:
+            results.append({"id": cid, "title": c["title"], "created": c["created"]})
+
+    results.sort(key=lambda c: c["created"], reverse=True)
+    return jsonify({"chats": results})
+
+
 @app.route("/chats/new", methods=["POST"])
 def new_chat():
+    user_chats = get_user_chats()
     chat_id = str(uuid.uuid4())
-    data_store["chats"][chat_id] = {
+    user_chats[chat_id] = {
         "title": "مکالمه جدید",
         "messages": [],
         "created": time.time(),
@@ -80,7 +201,8 @@ def new_chat():
 
 @app.route("/chats/<chat_id>", methods=["GET"])
 def get_chat(chat_id):
-    chat = data_store["chats"].get(chat_id)
+    user_chats = get_user_chats()
+    chat = user_chats.get(chat_id)
     if not chat:
         return jsonify({"error": "مکالمه پیدا نشد"}), 404
     return jsonify({"messages": chat["messages"]})
@@ -88,59 +210,52 @@ def get_chat(chat_id):
 
 @app.route("/chats/<chat_id>", methods=["DELETE"])
 def delete_chat(chat_id):
-    if chat_id in data_store["chats"]:
-        del data_store["chats"][chat_id]
+    user_chats = get_user_chats()
+    if chat_id in user_chats:
+        del user_chats[chat_id]
         save_data(data_store)
     return jsonify({"status": "حذف شد"})
 
 
+@app.route("/chats/<chat_id>/rename", methods=["POST"])
+def rename_chat(chat_id):
+    user_chats = get_user_chats()
+    new_title = (request.json or {}).get("title", "").strip()
+    if not new_title:
+        return jsonify({"error": "اسم نمی‌تونه خالی باشه"}), 400
+    if chat_id not in user_chats:
+        return jsonify({"error": "مکالمه پیدا نشد"}), 404
+    user_chats[chat_id]["title"] = new_title[:50]
+    save_data(data_store)
+    return jsonify({"status": "ok", "title": user_chats[chat_id]["title"]})
+
+
 @app.route("/chat", methods=["POST"])
 def chat():
+    """نسخه غیر-استریم (پشتیبان/جایگزین)"""
+    user_chats = get_user_chats()
     chat_id = request.json.get("chat_id")
     user_message = request.json.get("message", "").strip()
-    image_data = request.json.get("image")  # data URL مثل: data:image/jpeg;base64,....
+    image_data = request.json.get("image")
 
     if not user_message and not image_data:
         return jsonify({"error": "پیام خالی است"}), 400
 
-    if not chat_id or chat_id not in data_store["chats"]:
-        # اگه چتی مشخص نشده بود، یه چت جدید بساز
-        chat_id = str(uuid.uuid4())
-        data_store["chats"][chat_id] = {
-            "title": "مکالمه جدید",
-            "messages": [],
-            "created": time.time(),
-        }
+    allowed, err_msg = check_and_increment_usage()
+    if not allowed:
+        return jsonify({"error": err_msg}), 429
 
-    chat_obj = data_store["chats"][chat_id]
-
-    # اگه اولین پیام این مکالمه‌ست، عنوانشو از روش بساز
-    if len(chat_obj["messages"]) == 0:
-        chat_obj["title"] = make_title(user_message or "تصویر")
-
-    # ساخت محتوای پیام - اگه عکس داشت، به فرمت چندبخشی (متن + عکس) می‌سازیم
-    if image_data:
-        text_part = user_message or "این تصویر رو توضیح بده"
-        content = [
-            {"type": "text", "text": text_part},
-            {"type": "image_url", "image_url": {"url": image_data}},
-        ]
-    else:
-        content = user_message
-
+    chat_id, chat_obj = prepare_chat(chat_id, user_chats, user_message)
+    content = build_content(user_message, image_data)
     chat_obj["messages"].append({"role": "user", "content": content})
     save_data(data_store)
 
     try:
-        headers = {
-            "Authorization": f"Bearer {API_KEY}",
-            "content-type": "application/json",
-        }
+        headers = {"Authorization": f"Bearer {API_KEY}", "content-type": "application/json"}
         payload = {
             "model": MODEL,
-            "messages": chat_obj["messages"],
+            "messages": [{"role": "system", "content": SYSTEM_PROMPT}] + chat_obj["messages"],
         }
-
         res = requests.post(API_URL, headers=headers, json=payload, timeout=60)
         response_data = res.json()
 
@@ -149,7 +264,6 @@ def chat():
             return jsonify({"error": f"خطا در ارتباط با API: {error_msg}"}), 500
 
         assistant_reply = response_data["choices"][0]["message"]["content"]
-
         chat_obj["messages"].append({"role": "assistant", "content": assistant_reply})
         save_data(data_store)
 
@@ -157,6 +271,67 @@ def chat():
 
     except Exception as e:
         return jsonify({"error": f"خطا در ارتباط با API: {str(e)}"}), 500
+
+
+@app.route("/chat/stream", methods=["POST"])
+def chat_stream():
+    """نسخه استریم - جواب رو به‌صورت تکه‌تکه (تایپ‌شونده) برمی‌گردونه"""
+    user_chats = get_user_chats()
+    chat_id = request.json.get("chat_id")
+    user_message = request.json.get("message", "").strip()
+    image_data = request.json.get("image")
+
+    if not user_message and not image_data:
+        return jsonify({"error": "پیام خالی است"}), 400
+
+    allowed, err_msg = check_and_increment_usage()
+    if not allowed:
+        return jsonify({"error": err_msg}), 429
+
+    chat_id, chat_obj = prepare_chat(chat_id, user_chats, user_message)
+    content = build_content(user_message, image_data)
+    chat_obj["messages"].append({"role": "user", "content": content})
+    save_data(data_store)
+
+    def generate():
+        full_reply = ""
+        try:
+            headers = {"Authorization": f"Bearer {API_KEY}", "content-type": "application/json"}
+            payload = {
+                "model": MODEL,
+                "messages": [{"role": "system", "content": SYSTEM_PROMPT}] + chat_obj["messages"],
+                "stream": True,
+            }
+            with requests.post(API_URL, headers=headers, json=payload, timeout=120, stream=True) as res:
+                if res.status_code != 200:
+                    yield f"data: {json.dumps({'error': 'خطا در ارتباط با سرور هوش مصنوعی'})}\n\n"
+                    return
+                for line in res.iter_lines():
+                    if not line:
+                        continue
+                    decoded = line.decode("utf-8", errors="ignore")
+                    if not decoded.startswith("data: "):
+                        continue
+                    data_str = decoded[6:]
+                    if data_str.strip() == "[DONE]":
+                        break
+                    try:
+                        chunk = json.loads(data_str)
+                        delta = chunk["choices"][0]["delta"].get("content", "")
+                        if delta:
+                            full_reply += delta
+                            yield f"data: {json.dumps({'delta': delta})}\n\n"
+                    except Exception:
+                        continue
+        except Exception as e:
+            yield f"data: {json.dumps({'error': str(e)})}\n\n"
+        finally:
+            if full_reply:
+                chat_obj["messages"].append({"role": "assistant", "content": full_reply})
+                save_data(data_store)
+            yield f"data: {json.dumps({'done': True, 'chat_id': chat_id})}\n\n"
+
+    return Response(generate(), mimetype="text/event-stream")
 
 
 if __name__ == "__main__":
