@@ -1,2 +1,5 @@
 flask
 requests
+pypdf
+python-docx
+openpyxl
