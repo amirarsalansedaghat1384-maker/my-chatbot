@@ -11,6 +11,11 @@ import json
 import uuid
 import time
 import datetime
+import io
+import re
+from pypdf import PdfReader
+from docx import Document
+import openpyxl
 
 app = Flask(__name__)
 
@@ -33,6 +38,11 @@ COOKIE_NAME = "user_id"
 COOKIE_MAX_AGE = 60 * 60 * 24 * 365 * 2  # دو سال
 
 MAX_DAILY_MESSAGES = 30  # محدودیت پیام رایگان روزانه برای هر کاربر
+MAX_DOC_CHARS = 12000  # حداکثر تعداد کاراکتری که از یه فایل استخراج می‌کنیم
+MAX_UPLOAD_SIZE = 8 * 1024 * 1024  # حداکثر حجم فایل آپلودی: ۸ مگابایت
+
+MEMORY_TRIGGERS = ["یادت باشه", "به خاطر بسپار", "فراموش نکن", "یادت بمونه", "حفظ کن که"]
+MAX_MEMORY_NOTES = 30  # حداکثر تعداد یادداشت حافظه برای هر کاربر
 
 
 def load_data():
@@ -64,6 +74,84 @@ def get_user_entry():
 
 def get_user_chats():
     return get_user_entry()["chats"]
+
+
+def get_user_memory():
+    entry = get_user_entry()
+    if "memory" not in entry:
+        entry["memory"] = []
+    return entry["memory"]
+
+
+def check_memory_trigger(text):
+    """اگه پیام کاربر شامل یکی از عبارات یادآوری بود، اون رو به‌عنوان یادداشت حافظه برمی‌گردونه"""
+    for trigger in MEMORY_TRIGGERS:
+        if trigger in text:
+            return text.strip()
+    return None
+
+
+def add_memory_note(note):
+    notes = get_user_memory()
+    notes.append({"text": note, "created": time.time()})
+    if len(notes) > MAX_MEMORY_NOTES:
+        del notes[0]
+    save_data(data_store)
+
+
+def build_memory_context():
+    notes = get_user_memory()
+    if not notes:
+        return ""
+    lines = "\n".join(f"- {n['text']}" for n in notes)
+    return (
+        "\n\nچیزهایی که کاربر قبلاً ازت خواسته به خاطر بسپاری (در مکالمات قبلی):\n"
+        f"{lines}\n"
+        "این‌ها رو در نظر بگیر، ولی فقط وقتی مرتبطه ازشون استفاده کن."
+    )
+
+
+def extract_text_from_file(filename, file_bytes):
+    """متن رو از فایل PDF/Word/Excel/متنی استخراج می‌کنه"""
+    ext = filename.rsplit(".", 1)[-1].lower() if "." in filename else ""
+
+    try:
+        if ext == "pdf":
+            reader = PdfReader(io.BytesIO(file_bytes))
+            text = "\n".join((page.extract_text() or "") for page in reader.pages)
+        elif ext == "docx":
+            doc = Document(io.BytesIO(file_bytes))
+            text = "\n".join(p.text for p in doc.paragraphs)
+        elif ext in ("xlsx", "xlsm"):
+            wb = openpyxl.load_workbook(io.BytesIO(file_bytes), data_only=True)
+            parts = []
+            for sheet in wb.worksheets:
+                parts.append(f"--- شیت: {sheet.title} ---")
+                for row in sheet.iter_rows(values_only=True):
+                    line = " | ".join(str(cell) for cell in row if cell is not None)
+                    if line.strip():
+                        parts.append(line)
+            text = "\n".join(parts)
+        elif ext in ("txt", "csv", "md"):
+            text = file_bytes.decode("utf-8", errors="ignore")
+        elif ext == "doc":
+            return None, "فایل‌های Word با فرمت قدیمی (.doc) پشتیبانی نمی‌شن - لطفاً به .docx تبدیلش کن."
+        elif ext == "xls":
+            return None, "فایل‌های Excel با فرمت قدیمی (.xls) پشتیبانی نمی‌شن - لطفاً به .xlsx تبدیلش کن."
+        else:
+            return None, f"فرمت .{ext} پشتیبانی نمی‌شه."
+    except Exception as e:
+        return None, f"خطا در خوندن فایل: {str(e)}"
+
+    text = text.strip()
+    if not text:
+        return None, "متنی از این فایل استخراج نشد (ممکنه اسکن‌شده یا خالی باشه)."
+
+    truncated = len(text) > MAX_DOC_CHARS
+    if truncated:
+        text = text[:MAX_DOC_CHARS]
+
+    return text, ("truncated" if truncated else None)
 
 
 def make_title(first_message):
@@ -146,6 +234,53 @@ def usage_status():
     if usage["date"] != today:
         usage = {"date": today, "count": 0}
     return jsonify({"used": usage["count"], "limit": MAX_DAILY_MESSAGES})
+
+
+@app.route("/upload-document", methods=["POST"])
+def upload_document():
+    if "file" not in request.files:
+        return jsonify({"error": "فایلی ارسال نشد"}), 400
+
+    file = request.files["file"]
+    if file.filename == "":
+        return jsonify({"error": "فایلی انتخاب نشد"}), 400
+
+    file_bytes = file.read()
+    if len(file_bytes) > MAX_UPLOAD_SIZE:
+        return jsonify({"error": "حجم فایل بیشتر از ۸ مگابایته"}), 400
+
+    text, note = extract_text_from_file(file.filename, file_bytes)
+    if text is None:
+        return jsonify({"error": note}), 400
+
+    return jsonify({
+        "filename": file.filename,
+        "text": text,
+        "truncated": note == "truncated",
+    })
+
+
+@app.route("/memory", methods=["GET"])
+def get_memory():
+    return jsonify({"notes": get_user_memory()})
+
+
+@app.route("/memory", methods=["POST"])
+def add_memory_manual():
+    note = (request.json or {}).get("text", "").strip()
+    if not note:
+        return jsonify({"error": "متن نمی‌تونه خالی باشه"}), 400
+    add_memory_note(note)
+    return jsonify({"status": "ok", "notes": get_user_memory()})
+
+
+@app.route("/memory/<int:index>", methods=["DELETE"])
+def delete_memory(index):
+    notes = get_user_memory()
+    if 0 <= index < len(notes):
+        del notes[index]
+        save_data(data_store)
+    return jsonify({"notes": get_user_memory()})
 
 
 @app.route("/chats", methods=["GET"])
@@ -245,6 +380,10 @@ def chat():
     if not allowed:
         return jsonify({"error": err_msg}), 429
 
+    memory_note = check_memory_trigger(user_message)
+    if memory_note:
+        add_memory_note(memory_note)
+
     chat_id, chat_obj = prepare_chat(chat_id, user_chats, user_message)
     content = build_content(user_message, image_data)
     chat_obj["messages"].append({"role": "user", "content": content})
@@ -254,7 +393,7 @@ def chat():
         headers = {"Authorization": f"Bearer {API_KEY}", "content-type": "application/json"}
         payload = {
             "model": MODEL,
-            "messages": [{"role": "system", "content": SYSTEM_PROMPT}] + chat_obj["messages"],
+            "messages": [{"role": "system", "content": SYSTEM_PROMPT + build_memory_context()}] + chat_obj["messages"],
         }
         res = requests.post(API_URL, headers=headers, json=payload, timeout=60)
         response_data = res.json()
@@ -288,10 +427,16 @@ def chat_stream():
     if not allowed:
         return jsonify({"error": err_msg}), 429
 
+    memory_note = check_memory_trigger(user_message)
+    if memory_note:
+        add_memory_note(memory_note)
+
     chat_id, chat_obj = prepare_chat(chat_id, user_chats, user_message)
     content = build_content(user_message, image_data)
     chat_obj["messages"].append({"role": "user", "content": content})
     save_data(data_store)
+
+    system_content = SYSTEM_PROMPT + build_memory_context()
 
     def generate():
         full_reply = ""
@@ -299,7 +444,7 @@ def chat_stream():
             headers = {"Authorization": f"Bearer {API_KEY}", "content-type": "application/json"}
             payload = {
                 "model": MODEL,
-                "messages": [{"role": "system", "content": SYSTEM_PROMPT}] + chat_obj["messages"],
+                "messages": [{"role": "system", "content": system_content}] + chat_obj["messages"],
                 "stream": True,
             }
             with requests.post(API_URL, headers=headers, json=payload, timeout=120, stream=True) as res:
