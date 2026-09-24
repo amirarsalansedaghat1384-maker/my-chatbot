@@ -308,6 +308,7 @@
         align-items: center;
         color: var(--input-text);
     }
+    .sidebar-header > div { display: flex; gap: 6px; }
     .sidebar-search {
         padding: 8px 12px;
         border-bottom: 1px solid rgba(128,128,128,0.15);
@@ -380,13 +381,15 @@
     </div>
     <div class="chat-messages" id="messages"></div>
     <div class="image-preview-bar" id="imagePreviewBar">
-        <img id="imagePreviewImg" src="" alt="پیش‌نمایش">
-        <span style="font-size:12px;color:var(--muted-text);">عکس آماده ارسال</span>
+        <img id="imagePreviewImg" src="" alt="پیش‌نمایش" style="display:none">
+        <span id="imagePreviewLabel" style="font-size:12px;color:var(--muted-text);"></span>
         <button class="remove-img" onclick="removeSelectedImage()">✕</button>
     </div>
     <div class="chat-input">
         <button class="attach-btn" onclick="document.getElementById('imageInput').click()">📎</button>
-        <input type="file" id="imageInput" accept="image/*" style="display:none" onchange="handleImageSelect(event)">
+        <input type="file" id="imageInput"
+               accept="image/*,.pdf,.docx,.xlsx,.xlsm,.txt,.csv,.md"
+               style="display:none" onchange="handleFileSelect(event)">
         <button class="mic-btn" id="micBtn" onclick="toggleVoiceInput()">🎤</button>
         <input type="text" id="userInput" placeholder="پیامتو بنویس..." onkeypress="if(event.key==='Enter') sendMessage()">
         <button class="send-btn" onclick="sendMessage()">ارسال</button>
@@ -396,7 +399,10 @@
     <div class="sidebar" id="sidebar">
         <div class="sidebar-header">
             <span>مکالمات قبلی</span>
-            <button class="header-btn" onclick="toggleSidebar(false)">✕</button>
+            <div>
+                <button class="header-btn" onclick="openMemoryPanel()">🧠</button>
+                <button class="header-btn" onclick="toggleSidebar(false)">✕</button>
+            </div>
         </div>
         <div class="sidebar-search">
             <input type="text" id="searchInput" placeholder="🔍 جستجو در مکالمات..." oninput="handleSearchInput()">
@@ -404,11 +410,26 @@
         <button class="new-chat-btn-sidebar" onclick="startNewChat()">➕ مکالمه جدید</button>
         <div class="sidebar-list" id="chatList"></div>
     </div>
+
+    <div class="sidebar-overlay" id="memoryOverlay" onclick="closeMemoryPanel()"></div>
+    <div class="sidebar" id="memoryPanel">
+        <div class="sidebar-header">
+            <span>🧠 حافظه بین مکالمات</span>
+            <button class="header-btn" onclick="closeMemoryPanel()">✕</button>
+        </div>
+        <div class="sidebar-search">
+            <input type="text" id="memoryInput" placeholder="چیزی که می‌خوای همیشه یادم بمونه...">
+            <button class="new-chat-btn-sidebar" style="margin:8px 0 0 0;" onclick="addMemoryManual()">➕ اضافه کن</button>
+        </div>
+        <div class="sidebar-list" id="memoryList"></div>
+    </div>
 </div>
 
 <script>
 let currentChatId = localStorage.getItem('currentChatId') || null;
 let selectedImageData = null; // data URL عکس انتخاب‌شده
+let selectedDocumentText = null; // متن استخراج‌شده از سند
+let selectedDocumentName = null; // اسم فایل سند
 let searchDebounceTimer = null;
 let recognition = null;
 let isRecording = false;
@@ -541,20 +562,60 @@ function addCopyButton(el, text) {
     el.appendChild(copyBtn);
 }
 
-function handleImageSelect(event) {
+function handleFileSelect(event) {
     const file = event.target.files[0];
     if (!file) return;
-    const reader = new FileReader();
-    reader.onload = () => {
-        selectedImageData = reader.result;
-        document.getElementById('imagePreviewImg').src = selectedImageData;
-        document.getElementById('imagePreviewBar').classList.add('show');
-    };
-    reader.readAsDataURL(file);
+
+    if (file.type.startsWith('image/')) {
+        selectedDocumentText = null;
+        selectedDocumentName = null;
+        const reader = new FileReader();
+        reader.onload = () => {
+            selectedImageData = reader.result;
+            document.getElementById('imagePreviewImg').style.display = 'block';
+            document.getElementById('imagePreviewImg').src = selectedImageData;
+            document.getElementById('imagePreviewLabel').textContent = 'عکس آماده ارسال';
+            document.getElementById('imagePreviewBar').classList.add('show');
+        };
+        reader.readAsDataURL(file);
+        return;
+    }
+
+    // فایل سند (PDF/Word/Excel/متنی)
+    selectedImageData = null;
+    document.getElementById('imagePreviewImg').style.display = 'none';
+    document.getElementById('imagePreviewLabel').textContent = '⏳ در حال خوندن ' + file.name + '...';
+    document.getElementById('imagePreviewBar').classList.add('show');
+
+    const formData = new FormData();
+    formData.append('file', file);
+
+    fetch('/upload-document', { method: 'POST', body: formData })
+        .then(res => res.json())
+        .then(data => {
+            if (data.error) {
+                document.getElementById('imagePreviewLabel').textContent = '❌ ' + data.error;
+                selectedDocumentText = null;
+                selectedDocumentName = null;
+                setTimeout(removeSelectedImage, 2500);
+                return;
+            }
+            selectedDocumentText = data.text;
+            selectedDocumentName = data.filename;
+            let label = '📄 ' + data.filename + ' آماده ارساله';
+            if (data.truncated) label += ' (فقط بخشی ازش خونده شد)';
+            document.getElementById('imagePreviewLabel').textContent = label;
+        })
+        .catch(() => {
+            document.getElementById('imagePreviewLabel').textContent = '❌ خطا در آپلود فایل';
+            setTimeout(removeSelectedImage, 2500);
+        });
 }
 
 function removeSelectedImage() {
     selectedImageData = null;
+    selectedDocumentText = null;
+    selectedDocumentName = null;
     document.getElementById('imageInput').value = '';
     document.getElementById('imagePreviewBar').classList.remove('show');
 }
@@ -563,23 +624,92 @@ function clearMessagesView() {
     document.getElementById('messages').innerHTML = '';
 }
 
+// ---------- حافظه بین مکالمات ----------
+function openMemoryPanel() {
+    toggleSidebar(false);
+    document.getElementById('memoryPanel').classList.add('open');
+    document.getElementById('memoryOverlay').classList.add('open');
+    loadMemoryList();
+}
+
+function closeMemoryPanel() {
+    document.getElementById('memoryPanel').classList.remove('open');
+    document.getElementById('memoryOverlay').classList.remove('open');
+}
+
+async function loadMemoryList() {
+    const res = await fetch('/memory');
+    const data = await res.json();
+    const listEl = document.getElementById('memoryList');
+    listEl.innerHTML = '';
+
+    if (!data.notes || data.notes.length === 0) {
+        listEl.innerHTML = '<div style="padding:16px;color:var(--muted-text);font-size:13px;">هنوز چیزی ذخیره نشده. توی چت بگو «یادت باشه که...» یا از همین‌جا اضافه کن.</div>';
+        return;
+    }
+
+    data.notes.forEach((note, idx) => {
+        const item = document.createElement('div');
+        item.className = 'chat-item';
+
+        const titleSpan = document.createElement('div');
+        titleSpan.className = 'chat-item-title';
+        titleSpan.textContent = note.text;
+        titleSpan.style.whiteSpace = 'normal';
+
+        const delBtn = document.createElement('button');
+        delBtn.className = 'delete-chat-btn';
+        delBtn.textContent = '🗑️';
+        delBtn.onclick = async () => {
+            await fetch('/memory/' + idx, { method: 'DELETE' });
+            loadMemoryList();
+        };
+
+        item.appendChild(titleSpan);
+        item.appendChild(delBtn);
+        listEl.appendChild(item);
+    });
+}
+
+async function addMemoryManual() {
+    const input = document.getElementById('memoryInput');
+    const text = input.value.trim();
+    if (!text) return;
+    await fetch('/memory', {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({text})
+    });
+    input.value = '';
+    loadMemoryList();
+}
+
 // ---------- ارسال پیام با پاسخ استریم (تایپ‌شونده) ----------
 async function sendMessage() {
     const input = document.getElementById('userInput');
     const messagesDiv = document.getElementById('messages');
-    const text = input.value.trim();
-    if (!text && !selectedImageData) return;
+    let text = input.value.trim();
+    if (!text && !selectedImageData && !selectedDocumentText) return;
 
     if (selectedImageData) {
         addMessage([
             {type: 'image_url', image_url: {url: selectedImageData}},
             {type: 'text', text: text}
         ], 'user');
+    } else if (selectedDocumentText) {
+        const displayText = (text ? text + '\n\n' : '') + '📄 پیوست: ' + selectedDocumentName;
+        addMessage(displayText, 'user');
     } else {
         addMessage(text, 'user');
     }
 
     const imageToSend = selectedImageData;
+    let messageToSend = text;
+    if (selectedDocumentText) {
+        messageToSend = (text ? text + '\n\n' : 'این فایل رو بررسی کن و خلاصه‌ش رو بگو:\n\n') +
+            `--- محتوای فایل «${selectedDocumentName}» ---\n${selectedDocumentText}\n--- پایان فایل ---`;
+    }
+
     input.value = '';
     removeSelectedImage();
 
@@ -598,7 +728,7 @@ async function sendMessage() {
         const res = await fetch('/chat/stream', {
             method: 'POST',
             headers: {'Content-Type': 'application/json'},
-            body: JSON.stringify({message: text, chat_id: currentChatId, image: imageToSend})
+            body: JSON.stringify({message: messageToSend, chat_id: currentChatId, image: imageToSend})
         });
 
         if (!res.ok) {
