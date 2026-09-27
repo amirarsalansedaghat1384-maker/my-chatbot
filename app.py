@@ -4,7 +4,7 @@
 محدودیت پیام روزانه، پاسخ استریم (تایپ‌شونده)، جستجو در تاریخچه
 """
 
-from flask import Flask, render_template, request, jsonify, g, Response
+from flask import Flask, render_template, render_template_string, request, jsonify, g, Response, session, redirect, url_for
 import requests
 import os
 import json
@@ -13,11 +13,13 @@ import time
 import datetime
 import io
 import re
+from functools import wraps
 from pypdf import PdfReader
 from docx import Document
 import openpyxl
 
 app = Flask(__name__)
+app.secret_key = os.environ.get("SECRET_KEY", "یه-رشته-تصادفی-برای-امنیت-عوضش-کن")
 
 API_KEY = os.environ.get("OPENROUTER_API_KEY")
 
@@ -43,6 +45,8 @@ MAX_UPLOAD_SIZE = 8 * 1024 * 1024  # حداکثر حجم فایل آپلودی: 
 
 MEMORY_TRIGGERS = ["یادت باشه", "به خاطر بسپار", "فراموش نکن", "یادت بمونه", "حفظ کن که"]
 MAX_MEMORY_NOTES = 30  # حداکثر تعداد یادداشت حافظه برای هر کاربر
+
+ADMIN_PASSWORD = os.environ.get("ADMIN_PASSWORD", "admin123")
 
 
 def load_data():
@@ -477,6 +481,189 @@ def chat_stream():
             yield f"data: {json.dumps({'done': True, 'chat_id': chat_id})}\n\n"
 
     return Response(generate(), mimetype="text/event-stream")
+
+
+# ==================== پنل مدیریت ====================
+
+ADMIN_LOGIN_HTML = """
+<!DOCTYPE html>
+<html lang="fa" dir="rtl">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>ورود مدیر</title>
+<style>
+    body { font-family: Tahoma, sans-serif; background: #14141a; color: #eee;
+           display: flex; align-items: center; justify-content: center; height: 100vh; margin: 0; }
+    .box { background: #1e1e26; padding: 30px; border-radius: 14px; width: 90%; max-width: 340px; }
+    h2 { margin-top: 0; color: #8a6fff; text-align: center; }
+    input { width: 100%; padding: 12px; margin: 10px 0; border-radius: 8px; border: 1px solid #3a3a46;
+            background: #26262f; color: #eee; font-size: 15px; box-sizing: border-box; }
+    button { width: 100%; padding: 12px; border-radius: 8px; border: none; background: #6c47ff;
+             color: white; font-size: 15px; cursor: pointer; }
+    .error { color: #ff6b6b; text-align: center; font-size: 13px; }
+</style>
+</head>
+<body>
+<div class="box">
+    <h2>🔐 ورود به پنل مدیریت</h2>
+    {% if error %}<p class="error">{{ error }}</p>{% endif %}
+    <form method="POST">
+        <input type="password" name="password" placeholder="رمز عبور" autofocus>
+        <button type="submit">ورود</button>
+    </form>
+</div>
+</body>
+</html>
+"""
+
+ADMIN_PANEL_HTML = """
+<!DOCTYPE html>
+<html lang="fa" dir="rtl">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>پنل مدیریت</title>
+<style>
+    * { box-sizing: border-box; }
+    body { font-family: Tahoma, sans-serif; background: #14141a; color: #eee; margin: 0; padding: 16px; }
+    h2 { color: #8a6fff; }
+    .top-bar { display: flex; justify-content: space-between; align-items: center; margin-bottom: 16px; }
+    .logout-btn { background: #3a3a46; color: #eee; border: none; padding: 8px 14px; border-radius: 8px;
+                  text-decoration: none; font-size: 13px; }
+    .stats-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(140px, 1fr)); gap: 10px; margin-bottom: 20px; }
+    .stat-card { background: #1e1e26; padding: 16px; border-radius: 12px; text-align: center; }
+    .stat-card .num { font-size: 26px; font-weight: bold; color: #8a6fff; }
+    .stat-card .label { font-size: 12px; color: #999; margin-top: 4px; }
+    table { width: 100%; border-collapse: collapse; background: #1e1e26; border-radius: 12px; overflow: hidden; font-size: 13px; }
+    th, td { padding: 10px; text-align: right; border-bottom: 1px solid #2a2a34; }
+    th { background: #26262f; color: #8a6fff; }
+    .del-btn { background: #c0392b; color: white; border: none; padding: 5px 10px; border-radius: 6px;
+               font-size: 12px; cursor: pointer; }
+    .scroll-x { overflow-x: auto; }
+</style>
+</head>
+<body>
+<div class="top-bar">
+    <h2>📊 پنل مدیریت چت‌بات</h2>
+    <a class="logout-btn" href="{{ url_for('admin_logout') }}">خروج</a>
+</div>
+
+<div class="stats-grid">
+    <div class="stat-card"><div class="num">{{ total_users }}</div><div class="label">کاربران</div></div>
+    <div class="stat-card"><div class="num">{{ total_chats }}</div><div class="label">مکالمات</div></div>
+    <div class="stat-card"><div class="num">{{ total_messages }}</div><div class="label">کل پیام‌ها</div></div>
+    <div class="stat-card"><div class="num">{{ messages_today }}</div><div class="label">پیام‌های امروز</div></div>
+</div>
+
+<div class="scroll-x">
+<table>
+    <tr>
+        <th>شناسه کاربر</th>
+        <th>تعداد مکالمات</th>
+        <th>پیام امروز</th>
+        <th>یادداشت حافظه</th>
+        <th></th>
+    </tr>
+    {% for u in users %}
+    <tr>
+        <td>{{ u.id }}</td>
+        <td>{{ u.chat_count }}</td>
+        <td>{{ u.today_count }} / {{ limit }}</td>
+        <td>{{ u.memory_count }}</td>
+        <td>
+            <form method="POST" action="{{ url_for('admin_delete_user', user_id=u.full_id) }}"
+                  onsubmit="return confirm('کل داده‌های این کاربر پاک بشه؟');">
+                <button class="del-btn" type="submit">حذف</button>
+            </form>
+        </td>
+    </tr>
+    {% endfor %}
+</table>
+</div>
+</body>
+</html>
+"""
+
+
+def admin_required(view_func):
+    @wraps(view_func)
+    def wrapper(*args, **kwargs):
+        if not session.get("is_admin"):
+            return redirect(url_for("admin_login"))
+        return view_func(*args, **kwargs)
+    return wrapper
+
+
+@app.route("/admin/login", methods=["GET", "POST"])
+def admin_login():
+    error = None
+    if request.method == "POST":
+        if request.form.get("password") == ADMIN_PASSWORD:
+            session["is_admin"] = True
+            return redirect(url_for("admin_panel"))
+        error = "رمز عبور اشتباهه"
+    return render_template_string(ADMIN_LOGIN_HTML, error=error)
+
+
+@app.route("/admin/logout")
+def admin_logout():
+    session.pop("is_admin", None)
+    return redirect(url_for("admin_login"))
+
+
+@app.route("/admin")
+@admin_required
+def admin_panel():
+    today = datetime.date.today().isoformat()
+    users_data = data_store.get("users", {})
+
+    total_users = len(users_data)
+    total_chats = 0
+    total_messages = 0
+    messages_today = 0
+    users_list = []
+
+    for uid, entry in users_data.items():
+        chats = entry.get("chats", {})
+        chat_count = len(chats)
+        msg_count = sum(len(c.get("messages", [])) for c in chats.values())
+        usage = entry.get("usage", {"date": today, "count": 0})
+        today_count = usage["count"] if usage.get("date") == today else 0
+        memory_count = len(entry.get("memory", []))
+
+        total_chats += chat_count
+        total_messages += msg_count
+        messages_today += today_count
+
+        users_list.append({
+            "id": uid[:8] + "...",
+            "full_id": uid,
+            "chat_count": chat_count,
+            "today_count": today_count,
+            "memory_count": memory_count,
+        })
+
+    users_list.sort(key=lambda u: u["today_count"], reverse=True)
+
+    return render_template_string(
+        ADMIN_PANEL_HTML,
+        total_users=total_users,
+        total_chats=total_chats,
+        total_messages=total_messages,
+        messages_today=messages_today,
+        users=users_list,
+        limit=MAX_DAILY_MESSAGES,
+    )
+
+
+@app.route("/admin/delete-user/<user_id>", methods=["POST"])
+@admin_required
+def admin_delete_user(user_id):
+    if user_id in data_store.get("users", {}):
+        del data_store["users"][user_id]
+        save_data(data_store)
+    return redirect(url_for("admin_panel"))
 
 
 if __name__ == "__main__":
