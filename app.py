@@ -26,6 +26,27 @@ API_KEY = os.environ.get("OPENROUTER_API_KEY")
 API_URL = "https://openrouter.ai/api/v1/chat/completions"
 MODEL = "openrouter/free"
 
+# تعریف سرویس‌دهنده‌های هوش مصنوعی قابل انتخاب.
+# هر کدوم کلیدش رو از متغیر محیطی روی Railway می‌خونه - همه‌شون متعلق به خود توئه،
+# کاربر فقط از بینشون یکی رو انتخاب می‌کنه، نیازی به وارد کردن کلید شخصی نیست.
+PROVIDERS = {
+    "openrouter": {
+        "label": "🆓 رایگان (OpenRouter)",
+        "url": API_URL,
+        "model": MODEL,
+        "supports_vision": True,
+        "api_key": API_KEY,
+    },
+    "atria": {
+        "label": "🚀 Atria Dawn",
+        "url": "https://api.atria-asi.ai/v1/chat/completions",
+        "model": "Atria-Dawn-Preview",
+        "supports_vision": False,  # این مدل فقط متنی هست
+        "api_key": os.environ.get("ATRIA_API_KEY"),
+    },
+}
+DEFAULT_PROVIDER = "openrouter"
+
 SYSTEM_PROMPT = (
     "تو یک دستیار هوش مصنوعی فارسی‌زبان هستی. همیشه فقط و فقط به زبان فارسی روان و "
     "طبیعی پاسخ بده و هیچ کلمه یا جمله‌ای از زبان‌های دیگر (انگلیسی، اسپانیایی، رومانیایی و غیره) "
@@ -85,6 +106,19 @@ def get_user_memory():
     if "memory" not in entry:
         entry["memory"] = []
     return entry["memory"]
+
+
+def get_provider_config(user_entry):
+    """تنظیمات سرویس‌دهنده‌ی فعلی کاربر رو برمی‌گردونه: (api_key, url, model, supports_vision, error)"""
+    provider_id = user_entry.get("provider", DEFAULT_PROVIDER)
+    if provider_id not in PROVIDERS or not PROVIDERS[provider_id]["api_key"]:
+        provider_id = DEFAULT_PROVIDER
+
+    provider = PROVIDERS[provider_id]
+    if not provider["api_key"]:
+        return None, None, None, None, "هیچ مدلی روی سرور فعال نیست - باید کلید API حداقل یکی رو تنظیم کنی."
+
+    return provider["api_key"], provider["url"], provider["model"], provider["supports_vision"], None
 
 
 def check_memory_trigger(text):
@@ -237,7 +271,52 @@ def usage_status():
     usage = user_entry.get("usage", {"date": today, "count": 0})
     if usage["date"] != today:
         usage = {"date": today, "count": 0}
-    return jsonify({"used": usage["count"], "limit": MAX_DAILY_MESSAGES})
+    provider_id = user_entry.get("provider", DEFAULT_PROVIDER)
+    if provider_id not in PROVIDERS or not PROVIDERS[provider_id]["api_key"]:
+        provider_id = DEFAULT_PROVIDER
+    return jsonify({
+        "used": usage["count"],
+        "limit": MAX_DAILY_MESSAGES,
+        "provider": provider_id,
+        "provider_label": PROVIDERS[provider_id]["label"],
+    })
+
+
+@app.route("/settings", methods=["GET"])
+def get_settings():
+    user_entry = get_user_entry()
+    current = user_entry.get("provider", DEFAULT_PROVIDER)
+    if current not in PROVIDERS or not PROVIDERS[current]["api_key"]:
+        current = DEFAULT_PROVIDER
+    return jsonify({
+        "provider": current,
+        "providers": [
+            {
+                "id": pid,
+                "label": p["label"],
+                "supports_vision": p["supports_vision"],
+                "available": bool(p["api_key"]),
+            }
+            for pid, p in PROVIDERS.items()
+        ],
+    })
+
+
+@app.route("/settings", methods=["POST"])
+def update_settings():
+    user_entry = get_user_entry()
+    body = request.json or {}
+
+    provider_id = body.get("provider")
+    if provider_id:
+        if provider_id not in PROVIDERS:
+            return jsonify({"error": "سرویس‌دهنده‌ی نامعتبر"}), 400
+        if not PROVIDERS[provider_id]["api_key"]:
+            return jsonify({"error": "کلید این مدل هنوز روی سرور تنظیم نشده"}), 400
+        user_entry["provider"] = provider_id
+
+    save_data(data_store)
+    return jsonify({"status": "ok"})
 
 
 @app.route("/upload-document", methods=["POST"])
@@ -372,13 +451,20 @@ def rename_chat(chat_id):
 @app.route("/chat", methods=["POST"])
 def chat():
     """نسخه غیر-استریم (پشتیبان/جایگزین)"""
-    user_chats = get_user_chats()
+    user_entry = get_user_entry()
+    user_chats = user_entry["chats"]
     chat_id = request.json.get("chat_id")
     user_message = request.json.get("message", "").strip()
     image_data = request.json.get("image")
 
     if not user_message and not image_data:
         return jsonify({"error": "پیام خالی است"}), 400
+
+    provider_key, provider_url, provider_model, supports_vision, provider_err = get_provider_config(user_entry)
+    if provider_err:
+        return jsonify({"error": provider_err}), 400
+    if image_data and not supports_vision:
+        return jsonify({"error": "مدل انتخابی‌ات فقط متنی هست و عکس رو نمی‌فهمه. از تنظیمات مدل رو عوض کن یا عکس رو حذف کن."}), 400
 
     allowed, err_msg = check_and_increment_usage()
     if not allowed:
@@ -394,12 +480,12 @@ def chat():
     save_data(data_store)
 
     try:
-        headers = {"Authorization": f"Bearer {API_KEY}", "content-type": "application/json"}
+        headers = {"Authorization": f"Bearer {provider_key}", "content-type": "application/json"}
         payload = {
-            "model": MODEL,
+            "model": provider_model,
             "messages": [{"role": "system", "content": SYSTEM_PROMPT + build_memory_context()}] + chat_obj["messages"],
         }
-        res = requests.post(API_URL, headers=headers, json=payload, timeout=60)
+        res = requests.post(provider_url, headers=headers, json=payload, timeout=60)
         response_data = res.json()
 
         if res.status_code != 200:
@@ -419,13 +505,20 @@ def chat():
 @app.route("/chat/stream", methods=["POST"])
 def chat_stream():
     """نسخه استریم - جواب رو به‌صورت تکه‌تکه (تایپ‌شونده) برمی‌گردونه"""
-    user_chats = get_user_chats()
+    user_entry = get_user_entry()
+    user_chats = user_entry["chats"]
     chat_id = request.json.get("chat_id")
     user_message = request.json.get("message", "").strip()
     image_data = request.json.get("image")
 
     if not user_message and not image_data:
         return jsonify({"error": "پیام خالی است"}), 400
+
+    provider_key, provider_url, provider_model, supports_vision, provider_err = get_provider_config(user_entry)
+    if provider_err:
+        return jsonify({"error": provider_err}), 400
+    if image_data and not supports_vision:
+        return jsonify({"error": "مدل انتخابی‌ات فقط متنی هست و عکس رو نمی‌فهمه. از تنظیمات مدل رو عوض کن یا عکس رو حذف کن."}), 400
 
     allowed, err_msg = check_and_increment_usage()
     if not allowed:
@@ -445,13 +538,13 @@ def chat_stream():
     def generate():
         full_reply = ""
         try:
-            headers = {"Authorization": f"Bearer {API_KEY}", "content-type": "application/json"}
+            headers = {"Authorization": f"Bearer {provider_key}", "content-type": "application/json"}
             payload = {
-                "model": MODEL,
+                "model": provider_model,
                 "messages": [{"role": "system", "content": system_content}] + chat_obj["messages"],
                 "stream": True,
             }
-            with requests.post(API_URL, headers=headers, json=payload, timeout=120, stream=True) as res:
+            with requests.post(provider_url, headers=headers, json=payload, timeout=120, stream=True) as res:
                 if res.status_code != 200:
                     yield f"data: {json.dumps({'error': 'خطا در ارتباط با سرور هوش مصنوعی'})}\n\n"
                     return
