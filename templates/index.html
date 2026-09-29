@@ -365,6 +365,21 @@
         cursor: pointer;
         font-size: 14px;
     }
+    .provider-option {
+        display: flex;
+        align-items: center;
+        gap: 8px;
+        padding: 12px;
+        border: 1px solid var(--input-border);
+        border-radius: 10px;
+        margin-bottom: 8px;
+        cursor: pointer;
+        font-size: 13px;
+    }
+    .provider-option.selected {
+        border-color: #8a6fff;
+        background: var(--sidebar-hover);
+    }
 </style>
 </head>
 <body>
@@ -400,6 +415,7 @@
         <div class="sidebar-header">
             <span>مکالمات قبلی</span>
             <div>
+                <button class="header-btn" onclick="openSettingsPanel()">⚙️</button>
                 <button class="header-btn" onclick="openMemoryPanel()">🧠</button>
                 <button class="header-btn" onclick="toggleSidebar(false)">✕</button>
             </div>
@@ -422,6 +438,20 @@
             <button class="new-chat-btn-sidebar" style="margin:8px 0 0 0;" onclick="addMemoryManual()">➕ اضافه کن</button>
         </div>
         <div class="sidebar-list" id="memoryList"></div>
+    </div>
+
+    <div class="sidebar-overlay" id="settingsOverlay" onclick="closeSettingsPanel()"></div>
+    <div class="sidebar" id="settingsPanel">
+        <div class="sidebar-header">
+            <span>⚙️ انتخاب مدل</span>
+            <button class="header-btn" onclick="closeSettingsPanel()">✕</button>
+        </div>
+        <div style="padding:16px; overflow-y:auto; color:var(--input-text);">
+            <p style="font-size:12px; color:var(--muted-text); margin-top:0;">
+                مدلی که ازش استفاده می‌کنی رو انتخاب کن.
+            </p>
+            <div id="providerOptions"></div>
+        </div>
     </div>
 </div>
 
@@ -501,7 +531,7 @@ async function refreshUsage() {
         const res = await fetch('/usage');
         const data = await res.json();
         document.getElementById('usageBar').textContent =
-            `پیام‌های امروز: ${data.used} از ${data.limit}`;
+            `${data.provider_label} · پیام‌های امروز: ${data.used} از ${data.limit}`;
     } catch (e) {}
 }
 
@@ -622,6 +652,61 @@ function removeSelectedImage() {
 
 function clearMessagesView() {
     document.getElementById('messages').innerHTML = '';
+}
+
+// ---------- انتخاب مدل ----------
+function openSettingsPanel() {
+    toggleSidebar(false);
+    document.getElementById('settingsPanel').classList.add('open');
+    document.getElementById('settingsOverlay').classList.add('open');
+    loadProviderOptions();
+}
+
+function closeSettingsPanel() {
+    document.getElementById('settingsPanel').classList.remove('open');
+    document.getElementById('settingsOverlay').classList.remove('open');
+}
+
+async function loadProviderOptions() {
+    const res = await fetch('/settings');
+    const data = await res.json();
+    const container = document.getElementById('providerOptions');
+    container.innerHTML = '';
+
+    data.providers.forEach(p => {
+        const opt = document.createElement('div');
+        opt.className = 'provider-option' + (p.id === data.provider ? ' selected' : '');
+        if (!p.available) opt.style.opacity = '0.45';
+
+        const textDiv = document.createElement('div');
+        textDiv.style.flex = '1';
+        textDiv.innerHTML = `<div>${p.label}</div>` +
+            (p.supports_vision ? '' : '<div style="font-size:11px;color:var(--muted-text);">فقط متنی - عکس نمی‌فهمه</div>') +
+            (p.available ? '' : '<div style="font-size:11px;color:#ff6b6b;">کلیدش هنوز روی سرور تنظیم نشده</div>');
+
+        opt.appendChild(textDiv);
+        if (p.id === data.provider) {
+            const check = document.createElement('span');
+            check.textContent = '✅';
+            opt.appendChild(check);
+        }
+
+        if (p.available) {
+            opt.onclick = () => selectProvider(p.id);
+        }
+
+        container.appendChild(opt);
+    });
+}
+
+async function selectProvider(providerId) {
+    await fetch('/settings', {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({provider: providerId})
+    });
+    loadProviderOptions();
+    refreshUsage();
 }
 
 // ---------- حافظه بین مکالمات ----------
