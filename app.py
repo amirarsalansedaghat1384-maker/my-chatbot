@@ -44,6 +44,34 @@ PROVIDERS = {
         "supports_vision": False,  # این مدل فقط متنی هست
         "api_key": os.environ.get("ATRIA_API_KEY"),
     },
+    "gemini": {
+        "label": "✨ Gemini",
+        "url": "https://generativelanguage.googleapis.com/v1beta/openai/chat/completions",
+        "model": "gemini-2.0-flash",
+        "supports_vision": True,
+        "api_key": os.environ.get("GEMINI_API_KEY"),
+    },
+    "groq": {
+        "label": "⚡ Groq",
+        "url": "https://api.groq.com/openai/v1/chat/completions",
+        "model": "llama-3.3-70b-versatile",
+        "supports_vision": False,
+        "api_key": os.environ.get("GROQ_API_KEY"),
+    },
+    "minimax": {
+        "label": "🌀 MiniMax",
+        "url": "https://api.minimax.io/v1/chat/completions",
+        "model": "MiniMax-M2.1",
+        "supports_vision": False,
+        "api_key": os.environ.get("MINIMAX_API_KEY"),
+    },
+    "deepinfra": {
+        "label": "🧩 DeepInfra",
+        "url": "https://api.deepinfra.com/v1/openai/chat/completions",
+        "model": "meta-llama/Llama-3.3-70B-Instruct",
+        "supports_vision": False,
+        "api_key": os.environ.get("DEEPINFRA_API_KEY"),
+    },
 }
 DEFAULT_PROVIDER = "openrouter"
 
