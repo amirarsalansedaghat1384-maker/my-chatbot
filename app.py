@@ -47,14 +47,14 @@ PROVIDERS = {
     "gemini": {
         "label": "✨ Gemini",
         "url": "https://generativelanguage.googleapis.com/v1beta/openai/chat/completions",
-        "model": "gemini-2.0-flash",
+        "model": "gemini-3.8-flash",
         "supports_vision": True,
         "api_key": os.environ.get("GEMINI_API_KEY"),
     },
     "groq": {
         "label": "⚡ Groq",
         "url": "https://api.groq.com/openai/v1/chat/completions",
-        "model": "llama-3.3-70b-versatile",
+        "model": "openai/gpt-oss-20b",
         "supports_vision": False,
         "api_key": os.environ.get("GROQ_API_KEY"),
     },
