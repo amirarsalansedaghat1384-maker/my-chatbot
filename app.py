@@ -574,7 +574,14 @@ def chat_stream():
             }
             with requests.post(provider_url, headers=headers, json=payload, timeout=120, stream=True) as res:
                 if res.status_code != 200:
-                    yield f"data: {json.dumps({'error': 'خطا در ارتباط با سرور هوش مصنوعی'})}\n\n"
+                    try:
+                        err_body = res.json()
+                        err_detail = err_body.get("error", {})
+                        if isinstance(err_detail, dict):
+                            err_detail = err_detail.get("message", str(err_body))
+                    except Exception:
+                        err_detail = res.text[:300]
+                    yield f"data: {json.dumps({'error': f'کد {res.status_code}: {err_detail}'})}\n\n"
                     return
                 for line in res.iter_lines():
                     if not line:
