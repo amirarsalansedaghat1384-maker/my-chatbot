@@ -808,6 +808,7 @@ async function sendMessage() {
     messagesDiv.scrollTop = messagesDiv.scrollHeight;
 
     let fullText = '';
+    let receivedImage = null;
 
     try {
         const res = await fetch('/chat/stream', {
@@ -850,6 +851,15 @@ async function sendMessage() {
                     fullText += payload.delta;
                     assistantEl.innerHTML = renderMarkdown(fullText);
                     assistantEl.appendChild(cursor);
+                    messagesDiv.scrollTop = messagesDiv.scrollHeight;
+                } else if (payload.image) {
+                    receivedImage = payload.image;
+                    cursor.remove();
+                    assistantEl.innerHTML = '';
+                    const img = document.createElement('img');
+                    img.src = payload.image;
+                    img.className = 'msg-image';
+                    assistantEl.appendChild(img);
                     messagesDiv.scrollTop = messagesDiv.scrollHeight;
                 } else if (payload.error) {
                     assistantEl.innerHTML = renderMarkdown(fullText || ('خطا: ' + payload.error));
