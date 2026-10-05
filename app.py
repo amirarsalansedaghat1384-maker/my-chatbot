@@ -58,22 +58,18 @@ PROVIDERS = {
         "supports_vision": False,
         "api_key": os.environ.get("GROQ_API_KEY"),
     },
-    "minimax": {
-        "label": "🌀 MiniMax",
-        "url": "https://api.minimax.io/v1/chat/completions",
-        "model": "MiniMax-M2.1",
-        "supports_vision": False,
-        "api_key": os.environ.get("MINIMAX_API_KEY"),
-    },
-    "deepinfra": {
-        "label": "🧩 DeepInfra",
-        "url": "https://api.deepinfra.com/v1/openai/chat/completions",
-        "model": "meta-llama/Llama-3.3-70B-Instruct",
-        "supports_vision": False,
-        "api_key": os.environ.get("DEEPINFRA_API_KEY"),
-    },
 }
 DEFAULT_PROVIDER = "openrouter"
+
+# ---- ساخت عکس با Cloudflare Workers AI ----
+CF_ACCOUNT_ID = os.environ.get("CF_ACCOUNT_ID")
+CF_API_TOKEN = os.environ.get("CF_API_TOKEN")
+CF_IMAGE_MODEL = "@cf/black-forest-labs/flux-1-schnell"
+
+IMAGE_GEN_TRIGGERS = [
+    "عکس بساز", "تصویر بساز", "یه عکس از", "یک عکس از", "عکسی از",
+    "نقاشی بکش", "نقاشی کن", "برام بکش", "یه نقاشی از", "یک نقاشی از",
+]
 
 SYSTEM_PROMPT = (
     "تو یک دستیار هوش مصنوعی فارسی‌زبان هستی. همیشه فقط و فقط به زبان فارسی روان و "
@@ -249,6 +245,38 @@ def build_content(user_message, image_data):
             {"type": "image_url", "image_url": {"url": image_data}},
         ]
     return user_message
+
+
+def detect_image_generation_request(text):
+    """اگه پیام کاربر درخواست ساخت عکس بود، True برمی‌گردونه"""
+    for trig in IMAGE_GEN_TRIGGERS:
+        if trig in text:
+            return True
+    return False
+
+
+def generate_image(prompt):
+    """یه عکس از روی prompt با Cloudflare Workers AI می‌سازه. برمی‌گردونه: (data_url, error)"""
+    if not CF_ACCOUNT_ID or not CF_API_TOKEN:
+        return None, "قابلیت ساخت عکس هنوز روی سرور فعال نشده (کلید Cloudflare تنظیم نشده)."
+
+    url = f"https://api.cloudflare.com/client/v4/accounts/{CF_ACCOUNT_ID}/ai/run/{CF_IMAGE_MODEL}"
+    headers = {"Authorization": f"Bearer {CF_API_TOKEN}", "content-type": "application/json"}
+
+    try:
+        res = requests.post(url, headers=headers, json={"prompt": prompt}, timeout=60)
+        data = res.json()
+
+        if not data.get("success"):
+            errors = data.get("errors") or [{"message": "خطای نامشخص"}]
+            msg = errors[0].get("message", "خطای نامشخص")
+            return None, f"خطا در ساخت عکس: {msg}"
+
+        b64_image = data["result"]["image"]
+        return f"data:image/png;base64,{b64_image}", None
+
+    except Exception as e:
+        return None, f"خطا در ارتباط با سرویس ساخت عکس: {str(e)}"
 
 
 def prepare_chat(chat_id, user_chats, user_message):
@@ -542,11 +570,15 @@ def chat_stream():
     if not user_message and not image_data:
         return jsonify({"error": "پیام خالی است"}), 400
 
-    provider_key, provider_url, provider_model, supports_vision, provider_err = get_provider_config(user_entry)
-    if provider_err:
-        return jsonify({"error": provider_err}), 400
-    if image_data and not supports_vision:
-        return jsonify({"error": "مدل انتخابی‌ات فقط متنی هست و عکس رو نمی‌فهمه. از تنظیمات مدل رو عوض کن یا عکس رو حذف کن."}), 400
+    # اگه درخواست ساخت عکس بود (و خودش عکسی آپلود نکرده)، مسیر جدا از چت متنی می‌ره
+    image_gen_requested = (not image_data) and detect_image_generation_request(user_message)
+
+    if not image_gen_requested:
+        provider_key, provider_url, provider_model, supports_vision, provider_err = get_provider_config(user_entry)
+        if provider_err:
+            return jsonify({"error": provider_err}), 400
+        if image_data and not supports_vision:
+            return jsonify({"error": "مدل انتخابی‌ات فقط متنی هست و عکس رو نمی‌فهمه. از تنظیمات مدل رو عوض کن یا عکس رو حذف کن."}), 400
 
     allowed, err_msg = check_and_increment_usage()
     if not allowed:
@@ -560,6 +592,20 @@ def chat_stream():
     content = build_content(user_message, image_data)
     chat_obj["messages"].append({"role": "user", "content": content})
     save_data(data_store)
+
+    if image_gen_requested:
+        def generate_image_stream():
+            img_url, err = generate_image(user_message)
+            if err:
+                yield f"data: {json.dumps({'error': err})}\n\n"
+            else:
+                assistant_content = [{"type": "image_url", "image_url": {"url": img_url}}]
+                chat_obj["messages"].append({"role": "assistant", "content": assistant_content})
+                save_data(data_store)
+                yield f"data: {json.dumps({'image': img_url})}\n\n"
+            yield f"data: {json.dumps({'done': True, 'chat_id': chat_id})}\n\n"
+
+        return Response(generate_image_stream(), mimetype="text/event-stream")
 
     system_content = SYSTEM_PROMPT + build_memory_context()
 
