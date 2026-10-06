@@ -255,6 +255,34 @@ def detect_image_generation_request(text):
     return False
 
 
+def translate_to_image_prompt(persian_text):
+    """درخواست فارسی رو به یه پرامپت کوتاه و واضح انگلیسی تبدیل می‌کنه تا مدل تصویر بهتر بفهمدش"""
+    if not API_KEY:
+        return persian_text
+    try:
+        headers = {"Authorization": f"Bearer {API_KEY}", "content-type": "application/json"}
+        payload = {
+            "model": MODEL,
+            "messages": [
+                {
+                    "role": "system",
+                    "content": (
+                        "Translate the user's image request into a short, vivid English prompt "
+                        "suitable for an image generation model. Output ONLY the prompt itself, "
+                        "nothing else - no quotes, no explanation, no extra text."
+                    ),
+                },
+                {"role": "user", "content": persian_text},
+            ],
+        }
+        res = requests.post(API_URL, headers=headers, json=payload, timeout=30)
+        data = res.json()
+        translated = data["choices"][0]["message"]["content"].strip()
+        return translated or persian_text
+    except Exception:
+        return persian_text  # اگه ترجمه شکست خورد، همون متن اصلی رو بفرست
+
+
 def generate_image(prompt):
     """یه عکس از روی prompt با Cloudflare Workers AI می‌سازه. برمی‌گردونه: (data_url, error)"""
     if not CF_ACCOUNT_ID or not CF_API_TOKEN:
@@ -595,7 +623,8 @@ def chat_stream():
 
     if image_gen_requested:
         def generate_image_stream():
-            img_url, err = generate_image(user_message)
+            english_prompt = translate_to_image_prompt(user_message)
+            img_url, err = generate_image(english_prompt)
             if err:
                 yield f"data: {json.dumps({'error': err})}\n\n"
             else:
