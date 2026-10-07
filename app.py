@@ -12,6 +12,7 @@ import uuid
 import time
 import datetime
 import io
+import base64
 import re
 from functools import wraps
 from pypdf import PdfReader
@@ -61,14 +62,21 @@ PROVIDERS = {
 }
 DEFAULT_PROVIDER = "openrouter"
 
-# ---- ساخت عکس با Cloudflare Workers AI ----
+# ---- ساخت و ویرایش عکس با Cloudflare Workers AI ----
 CF_ACCOUNT_ID = os.environ.get("CF_ACCOUNT_ID")
 CF_API_TOKEN = os.environ.get("CF_API_TOKEN")
 CF_IMAGE_MODEL = "@cf/black-forest-labs/flux-1-schnell"
+CF_IMG2IMG_MODEL = "@cf/runwayml/stable-diffusion-v1-5-img2img"
 
 IMAGE_GEN_TRIGGERS = [
     "عکس بساز", "تصویر بساز", "یه عکس از", "یک عکس از", "عکسی از",
     "نقاشی بکش", "نقاشی کن", "برام بکش", "یه نقاشی از", "یک نقاشی از",
+]
+
+IMAGE_EDIT_TRIGGERS = [
+    "تغییرش بده", "تغییر بده", "تبدیلش کن", "تبدیل کن", "رنگیش کن", "رنگی کن",
+    "سیاه و سفیدش کن", "سیاه سفیدش کن", "ویرایشش کن", "ویرایش کن",
+    "استایلشو عوض کن", "عوضش کن", "تغییرش رو بده",
 ]
 
 SYSTEM_PROMPT = (
@@ -255,6 +263,14 @@ def detect_image_generation_request(text):
     return False
 
 
+def detect_image_edit_request(text):
+    """اگه پیام کاربر (همراه با یه عکس آپلودشده) درخواست تغییر/ویرایش اون عکس بود، True برمی‌گردونه"""
+    for trig in IMAGE_EDIT_TRIGGERS:
+        if trig in text:
+            return True
+    return False
+
+
 def translate_to_image_prompt(persian_text):
     """درخواست فارسی رو به یه پرامپت کوتاه و واضح انگلیسی تبدیل می‌کنه تا مدل تصویر بهتر بفهمدش"""
     if not API_KEY:
@@ -305,6 +321,42 @@ def generate_image(prompt):
 
     except Exception as e:
         return None, f"خطا در ارتباط با سرویس ساخت عکس: {str(e)}"
+
+
+def edit_image(image_data_url, prompt):
+    """یه عکس ورودی رو طبق prompt تغییر می‌ده (img2img). برمی‌گردونه: (data_url, error)"""
+    if not CF_ACCOUNT_ID or not CF_API_TOKEN:
+        return None, "قابلیت ویرایش عکس هنوز روی سرور فعال نشده (کلید Cloudflare تنظیم نشده)."
+
+    # جدا کردن قسمت base64 از data URL (بعد از کاما)
+    try:
+        b64_data = image_data_url.split(",", 1)[1]
+    except (IndexError, AttributeError):
+        return None, "فرمت عکس ورودی نامعتبره."
+
+    url = f"https://api.cloudflare.com/client/v4/accounts/{CF_ACCOUNT_ID}/ai/run/{CF_IMG2IMG_MODEL}"
+    headers = {"Authorization": f"Bearer {CF_API_TOKEN}", "content-type": "application/json"}
+    payload = {"prompt": prompt, "image_b64": b64_data, "strength": 0.7}
+
+    try:
+        res = requests.post(url, headers=headers, json=payload, timeout=60)
+        content_type = res.headers.get("content-type", "")
+
+        if content_type.startswith("image/"):
+            encoded = base64.b64encode(res.content).decode("utf-8")
+            return f"data:image/png;base64,{encoded}", None
+
+        # اگه عکس نبود، یعنی خطا برگشته (معمولاً JSON)
+        try:
+            data = res.json()
+            errors = data.get("errors") or [{"message": "خطای نامشخص"}]
+            msg = errors[0].get("message", "خطای نامشخص")
+        except Exception:
+            msg = res.text[:300]
+        return None, f"خطا در ویرایش عکس: {msg}"
+
+    except Exception as e:
+        return None, f"خطا در ارتباط با سرویس ویرایش عکس: {str(e)}"
 
 
 def prepare_chat(chat_id, user_chats, user_message):
@@ -600,8 +652,10 @@ def chat_stream():
 
     # اگه درخواست ساخت عکس بود (و خودش عکسی آپلود نکرده)، مسیر جدا از چت متنی می‌ره
     image_gen_requested = (not image_data) and detect_image_generation_request(user_message)
+    # اگه یه عکس آپلود کرده و خواسته تغییرش بدیم (نه فقط توضیحش بدیم)
+    image_edit_requested = bool(image_data) and detect_image_edit_request(user_message)
 
-    if not image_gen_requested:
+    if not image_gen_requested and not image_edit_requested:
         provider_key, provider_url, provider_model, supports_vision, provider_err = get_provider_config(user_entry)
         if provider_err:
             return jsonify({"error": provider_err}), 400
@@ -635,6 +689,21 @@ def chat_stream():
             yield f"data: {json.dumps({'done': True, 'chat_id': chat_id})}\n\n"
 
         return Response(generate_image_stream(), mimetype="text/event-stream")
+
+    if image_edit_requested:
+        def edit_image_stream():
+            english_prompt = translate_to_image_prompt(user_message)
+            img_url, err = edit_image(image_data, english_prompt)
+            if err:
+                yield f"data: {json.dumps({'error': err})}\n\n"
+            else:
+                assistant_content = [{"type": "image_url", "image_url": {"url": img_url}}]
+                chat_obj["messages"].append({"role": "assistant", "content": assistant_content})
+                save_data(data_store)
+                yield f"data: {json.dumps({'image': img_url})}\n\n"
+            yield f"data: {json.dumps({'done': True, 'chat_id': chat_id})}\n\n"
+
+        return Response(edit_image_stream(), mimetype="text/event-stream")
 
     system_content = SYSTEM_PROMPT + build_memory_context()
 
