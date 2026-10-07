@@ -74,10 +74,12 @@ IMAGE_GEN_TRIGGERS = [
 ]
 
 IMAGE_EDIT_TRIGGERS = [
-    "تغییرش بده", "تغییر بده", "تبدیلش کن", "تبدیل کن", "رنگیش کن", "رنگی کن",
-    "سیاه و سفیدش کن", "سیاه سفیدش کن", "ویرایشش کن", "ویرایش کن",
-    "استایلشو عوض کن", "عوضش کن", "تغییرش رو بده",
+    "تغییر", "تبدیل", "ویرایش", "عوض", "رنگی", "رنگیش",
 ]
+# الگوهایی مثل «... رو سفید کن»، «... رو قرمز کن» و غیره
+IMAGE_EDIT_COLOR_PATTERN = re.compile(
+    r"(سفید|سیاه|قرمز|آبی|سبز|زرد|نارنجی|بنفش|صورتی|طلایی|خاکستری)\s*(ش)?\s*کن"
+)
 
 SYSTEM_PROMPT = (
     "تو یک دستیار هوش مصنوعی فارسی‌زبان هستی. همیشه فقط و فقط به زبان فارسی روان و "
@@ -255,6 +257,29 @@ def build_content(user_message, image_data):
     return user_message
 
 
+def sanitize_messages_for_provider(messages, supports_vision):
+    """
+    اگه مدل انتخابی تصویر رو نمی‌فهمه، پیام‌های قدیمی که فرمت چندبخشی (متن+عکس) دارن
+    رو به متن ساده تبدیل می‌کنه تا API اون سرویس رد نکنه.
+    """
+    if supports_vision:
+        return messages
+
+    cleaned = []
+    for msg in messages:
+        content = msg.get("content")
+        if isinstance(content, list):
+            text_parts = [p.get("text", "") for p in content if p.get("type") == "text"]
+            has_image = any(p.get("type") == "image_url" for p in content)
+            text = " ".join(t for t in text_parts if t).strip()
+            if has_image:
+                text = (text + " [یک عکس همراه این پیام بود]").strip()
+            cleaned.append({"role": msg["role"], "content": text or "[عکس]"})
+        else:
+            cleaned.append(msg)
+    return cleaned
+
+
 def detect_image_generation_request(text):
     """اگه پیام کاربر درخواست ساخت عکس بود، True برمی‌گردونه"""
     for trig in IMAGE_GEN_TRIGGERS:
@@ -268,6 +293,8 @@ def detect_image_edit_request(text):
     for trig in IMAGE_EDIT_TRIGGERS:
         if trig in text:
             return True
+    if IMAGE_EDIT_COLOR_PATTERN.search(text):
+        return True
     return False
 
 
@@ -617,9 +644,10 @@ def chat():
 
     try:
         headers = {"Authorization": f"Bearer {provider_key}", "content-type": "application/json"}
+        safe_messages = sanitize_messages_for_provider(chat_obj["messages"], supports_vision)
         payload = {
             "model": provider_model,
-            "messages": [{"role": "system", "content": SYSTEM_PROMPT + build_memory_context()}] + chat_obj["messages"],
+            "messages": [{"role": "system", "content": SYSTEM_PROMPT + build_memory_context()}] + safe_messages,
         }
         res = requests.post(provider_url, headers=headers, json=payload, timeout=60)
         response_data = res.json()
@@ -711,9 +739,10 @@ def chat_stream():
         full_reply = ""
         try:
             headers = {"Authorization": f"Bearer {provider_key}", "content-type": "application/json"}
+            safe_messages = sanitize_messages_for_provider(chat_obj["messages"], supports_vision)
             payload = {
                 "model": provider_model,
-                "messages": [{"role": "system", "content": system_content}] + chat_obj["messages"],
+                "messages": [{"role": "system", "content": system_content}] + safe_messages,
                 "stream": True,
             }
             with requests.post(provider_url, headers=headers, json=payload, timeout=120, stream=True) as res:
