@@ -13,6 +13,7 @@ import time
 import datetime
 import io
 import base64
+from PIL import Image
 import re
 from functools import wraps
 from pypdf import PdfReader
@@ -358,12 +359,23 @@ def edit_image(image_data_url, prompt):
     # جدا کردن قسمت base64 از data URL (بعد از کاما)
     try:
         b64_data = image_data_url.split(",", 1)[1]
-    except (IndexError, AttributeError):
+        raw_bytes = base64.b64decode(b64_data)
+    except Exception:
         return None, "فرمت عکس ورودی نامعتبره."
+
+    # کوچیک کردن عکس قبل از ارسال تا حجم درخواست زیاد نشه
+    try:
+        img = Image.open(io.BytesIO(raw_bytes)).convert("RGB")
+        img.thumbnail((768, 768))
+        buf = io.BytesIO()
+        img.save(buf, format="PNG")
+        image_byte_list = list(buf.getvalue())
+    except Exception as e:
+        return None, f"خطا در پردازش عکس ورودی: {str(e)}"
 
     url = f"https://api.cloudflare.com/client/v4/accounts/{CF_ACCOUNT_ID}/ai/run/{CF_IMG2IMG_MODEL}"
     headers = {"Authorization": f"Bearer {CF_API_TOKEN}", "content-type": "application/json"}
-    payload = {"prompt": prompt, "image_b64": b64_data, "strength": 0.7}
+    payload = {"prompt": prompt, "image": image_byte_list, "strength": 0.7}
 
     try:
         res = requests.post(url, headers=headers, json=payload, timeout=60)
