@@ -66,7 +66,7 @@ DEFAULT_PROVIDER = "openrouter"
 CF_ACCOUNT_ID = os.environ.get("CF_ACCOUNT_ID")
 CF_API_TOKEN = os.environ.get("CF_API_TOKEN")
 CF_IMAGE_MODEL = "@cf/black-forest-labs/flux-1-schnell"
-CF_IMG2IMG_MODEL = "@cf/runwayml/stable-diffusion-v1-5-img2img"
+CF_IMG2IMG_MODEL = "@cf/bytedance/stable-diffusion-xl-lightning"
 
 IMAGE_GEN_TRIGGERS = [
     "عکس بساز", "تصویر بساز", "یه عکس از", "یک عکس از", "عکسی از",
