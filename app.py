@@ -67,7 +67,7 @@ DEFAULT_PROVIDER = "openrouter"
 CF_ACCOUNT_ID = os.environ.get("CF_ACCOUNT_ID")
 CF_API_TOKEN = os.environ.get("CF_API_TOKEN")
 CF_IMAGE_MODEL = "@cf/black-forest-labs/flux-1-schnell"
-CF_IMG2IMG_MODEL = "@cf/bytedance/stable-diffusion-xl-lightning"
+CF_IMG2IMG_MODEL = "@cf/stabilityai/stable-diffusion-xl-base-1.0"
 
 IMAGE_GEN_TRIGGERS = [
     "عکس بساز", "تصویر بساز", "یه عکس از", "یک عکس از", "عکسی از",
@@ -369,13 +369,13 @@ def edit_image(image_data_url, prompt):
         img.thumbnail((768, 768))
         buf = io.BytesIO()
         img.save(buf, format="PNG")
-        image_byte_list = list(buf.getvalue())
+        resized_b64 = base64.b64encode(buf.getvalue()).decode("utf-8")
     except Exception as e:
         return None, f"خطا در پردازش عکس ورودی: {str(e)}"
 
     url = f"https://api.cloudflare.com/client/v4/accounts/{CF_ACCOUNT_ID}/ai/run/{CF_IMG2IMG_MODEL}"
     headers = {"Authorization": f"Bearer {CF_API_TOKEN}", "content-type": "application/json"}
-    payload = {"prompt": prompt, "image": image_byte_list, "strength": 0.7}
+    payload = {"prompt": prompt, "image_b64": resized_b64, "strength": 0.7}
 
     try:
         res = requests.post(url, headers=headers, json=payload, timeout=60)
