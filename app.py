@@ -14,6 +14,7 @@ import datetime
 import io
 import base64
 from PIL import Image
+from huggingface_hub import InferenceClient
 import re
 from functools import wraps
 from pypdf import PdfReader
@@ -66,13 +67,15 @@ DEFAULT_PROVIDER = "openrouter"
 # ---- ساخت و ویرایش عکس با Cloudflare Workers AI ----
 CF_ACCOUNT_ID = os.environ.get("CF_ACCOUNT_ID")
 CF_API_TOKEN = os.environ.get("CF_API_TOKEN")
+HF_API_KEY = os.environ.get("HF_API_KEY")
 CF_IMAGE_MODEL = "@cf/black-forest-labs/flux-1-schnell"
 CF_IMG2IMG_UNIVERSAL_URL = "https://api.cloudflare.com/client/v4/accounts/{account}/ai/run"
 CF_IMG2IMG_NATIVE_URL = "https://api.cloudflare.com/client/v4/accounts/{account}/ai/run/{model}"
 
-# زنجیره‌ی مدل‌های ویرایش عکس - اگه یکی خطا داد، خودکار میره سراغ بعدی
+# زنجیره‌ی مدل‌های ویرایش عکس - اگه یکی خطا داد (یا اعتبارش تموم شد)، خودکار میره سراغ بعدی
 IMG2IMG_CANDIDATES = [
-    {"model": "bria/fibo-edit-1.5", "kind": "gateway"},
+    {"model": "black-forest-labs/FLUX.1-Kontext-dev", "kind": "huggingface"},  # رایگان (سهمیه‌ی ماهانه محدود)
+    {"model": "bria/fibo-edit-1.5", "kind": "gateway"},  # پولی - فقط اگه حساب Cloudflare اعتبار داشته باشه
     {"model": "@cf/stabilityai/stable-diffusion-xl-base-1.0", "kind": "native_b64"},
     {"model": "@cf/bytedance/stable-diffusion-xl-lightning", "kind": "native_bytes"},
     {"model": "@cf/runwayml/stable-diffusion-v1-5-img2img", "kind": "native_b64"},
@@ -412,7 +415,20 @@ def _try_native_bytes_model(model, resized_data_url, resized_bytes, prompt, head
     return None, msg
 
 
+def _try_huggingface_model(model, resized_data_url, resized_bytes, prompt, headers):
+    """ویرایش عکس با Hugging Face Inference Providers (رایگان با سهمیه‌ی ماهانه‌ی محدود)"""
+    if not HF_API_KEY:
+        return None, "کلید Hugging Face روی سرور تنظیم نشده"
+    client = InferenceClient(provider="fal-ai", api_key=HF_API_KEY)
+    result_image = client.image_to_image(resized_bytes, prompt=prompt, model=model)
+    buf = io.BytesIO()
+    result_image.save(buf, format="PNG")
+    encoded = base64.b64encode(buf.getvalue()).decode("utf-8")
+    return f"data:image/png;base64,{encoded}", None
+
+
 _IMG2IMG_HANDLERS = {
+    "huggingface": _try_huggingface_model,
     "gateway": _try_gateway_model,
     "native_b64": _try_native_b64_model,
     "native_bytes": _try_native_bytes_model,
