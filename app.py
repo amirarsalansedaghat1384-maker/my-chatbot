@@ -67,7 +67,16 @@ DEFAULT_PROVIDER = "openrouter"
 CF_ACCOUNT_ID = os.environ.get("CF_ACCOUNT_ID")
 CF_API_TOKEN = os.environ.get("CF_API_TOKEN")
 CF_IMAGE_MODEL = "@cf/black-forest-labs/flux-1-schnell"
-CF_IMG2IMG_MODEL = "bria/fibo-edit-1.5"
+CF_IMG2IMG_UNIVERSAL_URL = "https://api.cloudflare.com/client/v4/accounts/{account}/ai/run"
+CF_IMG2IMG_NATIVE_URL = "https://api.cloudflare.com/client/v4/accounts/{account}/ai/run/{model}"
+
+# زنجیره‌ی مدل‌های ویرایش عکس - اگه یکی خطا داد، خودکار میره سراغ بعدی
+IMG2IMG_CANDIDATES = [
+    {"model": "bria/fibo-edit-1.5", "kind": "gateway"},
+    {"model": "@cf/stabilityai/stable-diffusion-xl-base-1.0", "kind": "native_b64"},
+    {"model": "@cf/bytedance/stable-diffusion-xl-lightning", "kind": "native_bytes"},
+    {"model": "@cf/runwayml/stable-diffusion-v1-5-img2img", "kind": "native_b64"},
+]
 
 IMAGE_GEN_TRIGGERS = [
     "عکس بساز", "تصویر بساز", "یه عکس از", "یک عکس از", "عکسی از",
@@ -351,8 +360,71 @@ def generate_image(prompt):
         return None, f"خطا در ارتباط با سرویس ساخت عکس: {str(e)}"
 
 
+def _try_gateway_model(model, resized_data_url, resized_bytes, prompt, headers):
+    """مدل‌های شخص‌ثالث (مثل bria/...) از مسیر یکپارچه‌ی جدید Cloudflare صدا زده می‌شن"""
+    url = CF_IMG2IMG_UNIVERSAL_URL.format(account=CF_ACCOUNT_ID)
+    payload = {"model": model, "input": {"images": [resized_data_url], "instruction": prompt}}
+    res = requests.post(url, headers=headers, json=payload, timeout=60)
+    data = res.json()
+    result = data.get("result", data) if isinstance(data, dict) else {}
+    image_url = result.get("image") if isinstance(result, dict) else None
+    if image_url:
+        return image_url, None
+    errors = data.get("errors") if isinstance(data, dict) else None
+    msg = errors[0].get("message", "خطای نامشخص") if errors else str(data)[:200]
+    return None, msg
+
+
+def _try_native_b64_model(model, resized_data_url, resized_bytes, prompt, headers):
+    """مدل‌های خود Cloudflare (@cf/...) که image_b64 قبول می‌کنن"""
+    b64_only = resized_data_url.split(",", 1)[1]
+    url = CF_IMG2IMG_NATIVE_URL.format(account=CF_ACCOUNT_ID, model=model)
+    payload = {"prompt": prompt, "image_b64": b64_only, "strength": 0.7}
+    res = requests.post(url, headers=headers, json=payload, timeout=60)
+    content_type = res.headers.get("content-type", "")
+    if content_type.startswith("image/"):
+        encoded = base64.b64encode(res.content).decode("utf-8")
+        return f"data:image/png;base64,{encoded}", None
+    try:
+        data = res.json()
+        errors = data.get("errors") or [{"message": "خطای نامشخص"}]
+        msg = errors[0].get("message", "خطای نامشخص")
+    except Exception:
+        msg = res.text[:200]
+    return None, msg
+
+
+def _try_native_bytes_model(model, resized_data_url, resized_bytes, prompt, headers):
+    """مدل‌های خود Cloudflare (@cf/...) که فقط آرایه‌ی بایت خام قبول می‌کنن"""
+    url = CF_IMG2IMG_NATIVE_URL.format(account=CF_ACCOUNT_ID, model=model)
+    payload = {"prompt": prompt, "image": list(resized_bytes), "strength": 0.7}
+    res = requests.post(url, headers=headers, json=payload, timeout=60)
+    content_type = res.headers.get("content-type", "")
+    if content_type.startswith("image/"):
+        encoded = base64.b64encode(res.content).decode("utf-8")
+        return f"data:image/png;base64,{encoded}", None
+    try:
+        data = res.json()
+        errors = data.get("errors") or [{"message": "خطای نامشخص"}]
+        msg = errors[0].get("message", "خطای نامشخص")
+    except Exception:
+        msg = res.text[:200]
+    return None, msg
+
+
+_IMG2IMG_HANDLERS = {
+    "gateway": _try_gateway_model,
+    "native_b64": _try_native_b64_model,
+    "native_bytes": _try_native_bytes_model,
+}
+
+
 def edit_image(image_data_url, prompt):
-    """یه عکس ورودی رو طبق یه دستور متنی تغییر می‌ده (با مدل bria/fibo-edit-1.5). برمی‌گردونه: (image_url, error)"""
+    """
+    یه عکس ورودی رو طبق یه دستور متنی تغییر می‌ده.
+    به‌ترتیب چند مدل مختلف رو امتحان می‌کنه؛ هر کدوم خطا داد، میره سراغ بعدی.
+    برمی‌گردونه: (image_url, error)
+    """
     if not CF_ACCOUNT_ID or not CF_API_TOKEN:
         return None, "قابلیت ویرایش عکس هنوز روی سرور فعال نشده (کلید Cloudflare تنظیم نشده)."
 
@@ -364,35 +436,27 @@ def edit_image(image_data_url, prompt):
         img.thumbnail((1024, 1024))
         buf = io.BytesIO()
         img.save(buf, format="PNG")
-        resized_b64 = base64.b64encode(buf.getvalue()).decode("utf-8")
+        resized_bytes = buf.getvalue()
+        resized_b64 = base64.b64encode(resized_bytes).decode("utf-8")
         resized_data_url = f"data:image/png;base64,{resized_b64}"
     except Exception as e:
         return None, f"خطا در پردازش عکس ورودی: {str(e)}"
 
-    url = f"https://api.cloudflare.com/client/v4/accounts/{CF_ACCOUNT_ID}/ai/run/{CF_IMG2IMG_MODEL}"
     headers = {"Authorization": f"Bearer {CF_API_TOKEN}", "content-type": "application/json"}
-    payload = {"images": [resized_data_url], "instruction": prompt}
 
-    try:
-        res = requests.post(url, headers=headers, json=payload, timeout=60)
-        data = res.json()
+    errors_log = []
+    for candidate in IMG2IMG_CANDIDATES:
+        handler = _IMG2IMG_HANDLERS[candidate["kind"]]
+        try:
+            image_url, err = handler(candidate["model"], resized_data_url, resized_bytes, prompt, headers)
+            if image_url:
+                return image_url, None
+            errors_log.append(f"{candidate['model']}: {err}")
+        except Exception as e:
+            errors_log.append(f"{candidate['model']}: {str(e)}")
 
-        # فرمت پاسخ ممکنه {"result": {...}} باشه یا مستقیم {...}
-        result = data.get("result", data) if isinstance(data, dict) else {}
-        image_url = result.get("image") if isinstance(result, dict) else None
-
-        if image_url:
-            return image_url, None
-
-        errors = data.get("errors") if isinstance(data, dict) else None
-        if errors:
-            msg = errors[0].get("message", "خطای نامشخص")
-        else:
-            msg = str(data)[:300]
-        return None, f"خطا در ویرایش عکس: {msg}"
-
-    except Exception as e:
-        return None, f"خطا در ارتباط با سرویس ویرایش عکس: {str(e)}"
+    combined = " | ".join(errors_log)
+    return None, f"همه‌ی مدل‌های ویرایش عکس خطا دادن: {combined}"
 
 
 def prepare_chat(chat_id, user_chats, user_message):
