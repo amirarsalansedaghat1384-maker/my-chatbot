@@ -67,7 +67,7 @@ DEFAULT_PROVIDER = "openrouter"
 CF_ACCOUNT_ID = os.environ.get("CF_ACCOUNT_ID")
 CF_API_TOKEN = os.environ.get("CF_API_TOKEN")
 CF_IMAGE_MODEL = "@cf/black-forest-labs/flux-1-schnell"
-CF_IMG2IMG_MODEL = "@cf/stabilityai/stable-diffusion-xl-base-1.0"
+CF_IMG2IMG_MODEL = "bria/fibo-edit-1.5"
 
 IMAGE_GEN_TRIGGERS = [
     "عکس بساز", "تصویر بساز", "یه عکس از", "یک عکس از", "عکسی از",
@@ -352,46 +352,43 @@ def generate_image(prompt):
 
 
 def edit_image(image_data_url, prompt):
-    """یه عکس ورودی رو طبق prompt تغییر می‌ده (img2img). برمی‌گردونه: (data_url, error)"""
+    """یه عکس ورودی رو طبق یه دستور متنی تغییر می‌ده (با مدل bria/fibo-edit-1.5). برمی‌گردونه: (image_url, error)"""
     if not CF_ACCOUNT_ID or not CF_API_TOKEN:
         return None, "قابلیت ویرایش عکس هنوز روی سرور فعال نشده (کلید Cloudflare تنظیم نشده)."
 
-    # جدا کردن قسمت base64 از data URL (بعد از کاما)
+    # کوچیک کردن عکس قبل از ارسال تا حجم درخواست زیاد نشه
     try:
         b64_data = image_data_url.split(",", 1)[1]
         raw_bytes = base64.b64decode(b64_data)
-    except Exception:
-        return None, "فرمت عکس ورودی نامعتبره."
-
-    # کوچیک کردن عکس قبل از ارسال تا حجم درخواست زیاد نشه
-    try:
         img = Image.open(io.BytesIO(raw_bytes)).convert("RGB")
-        img.thumbnail((768, 768))
+        img.thumbnail((1024, 1024))
         buf = io.BytesIO()
         img.save(buf, format="PNG")
         resized_b64 = base64.b64encode(buf.getvalue()).decode("utf-8")
+        resized_data_url = f"data:image/png;base64,{resized_b64}"
     except Exception as e:
         return None, f"خطا در پردازش عکس ورودی: {str(e)}"
 
     url = f"https://api.cloudflare.com/client/v4/accounts/{CF_ACCOUNT_ID}/ai/run/{CF_IMG2IMG_MODEL}"
     headers = {"Authorization": f"Bearer {CF_API_TOKEN}", "content-type": "application/json"}
-    payload = {"prompt": prompt, "image_b64": resized_b64, "strength": 0.7}
+    payload = {"images": [resized_data_url], "instruction": prompt}
 
     try:
         res = requests.post(url, headers=headers, json=payload, timeout=60)
-        content_type = res.headers.get("content-type", "")
+        data = res.json()
 
-        if content_type.startswith("image/"):
-            encoded = base64.b64encode(res.content).decode("utf-8")
-            return f"data:image/png;base64,{encoded}", None
+        # فرمت پاسخ ممکنه {"result": {...}} باشه یا مستقیم {...}
+        result = data.get("result", data) if isinstance(data, dict) else {}
+        image_url = result.get("image") if isinstance(result, dict) else None
 
-        # اگه عکس نبود، یعنی خطا برگشته (معمولاً JSON)
-        try:
-            data = res.json()
-            errors = data.get("errors") or [{"message": "خطای نامشخص"}]
+        if image_url:
+            return image_url, None
+
+        errors = data.get("errors") if isinstance(data, dict) else None
+        if errors:
             msg = errors[0].get("message", "خطای نامشخص")
-        except Exception:
-            msg = res.text[:300]
+        else:
+            msg = str(data)[:300]
         return None, f"خطا در ویرایش عکس: {msg}"
 
     except Exception as e:
