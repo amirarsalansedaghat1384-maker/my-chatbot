@@ -13,6 +13,7 @@ import time
 import datetime
 import io
 import base64
+from urllib.parse import quote as url_quote
 from PIL import Image
 from huggingface_hub import InferenceClient
 import re
@@ -68,12 +69,15 @@ DEFAULT_PROVIDER = "openrouter"
 CF_ACCOUNT_ID = os.environ.get("CF_ACCOUNT_ID")
 CF_API_TOKEN = os.environ.get("CF_API_TOKEN")
 HF_API_KEY = os.environ.get("HF_API_KEY")
+SENSENOVA_API_KEY = os.environ.get("SENSENOVA_API_KEY")
 CF_IMAGE_MODEL = "@cf/black-forest-labs/flux-1-schnell"
 CF_IMG2IMG_UNIVERSAL_URL = "https://api.cloudflare.com/client/v4/accounts/{account}/ai/run"
 CF_IMG2IMG_NATIVE_URL = "https://api.cloudflare.com/client/v4/accounts/{account}/ai/run/{model}"
 
 # زنجیره‌ی مدل‌های ویرایش عکس - اگه یکی خطا داد (یا اعتبارش تموم شد)، خودکار میره سراغ بعدی
 IMG2IMG_CANDIDATES = [
+    {"model": "sensenova-u1.5-lite", "kind": "sensenova"},  # رایگان (دوره بتا) - نیاز به SENSENOVA_API_KEY
+    {"model": "kontext", "kind": "pollinations"},  # کاملاً رایگان، بدون کلید
     {"model": "black-forest-labs/FLUX.1-Kontext-dev", "kind": "huggingface"},  # رایگان (سهمیه‌ی ماهانه محدود)
     {"model": "bria/fibo-edit-1.5", "kind": "gateway"},  # پولی - فقط اگه حساب Cloudflare اعتبار داشته باشه
     {"model": "@cf/stabilityai/stable-diffusion-xl-base-1.0", "kind": "native_b64"},
@@ -427,7 +431,51 @@ def _try_huggingface_model(model, resized_data_url, resized_bytes, prompt, heade
     return f"data:image/png;base64,{encoded}", None
 
 
+def _try_pollinations_model(model, resized_data_url, resized_bytes, prompt, headers):
+    """ویرایش عکس با Pollinations.ai (کاملاً رایگان، بدون نیاز به کلید)"""
+    encoded_prompt = url_quote(prompt)
+    encoded_image = url_quote(resized_data_url, safe="")
+    url = f"https://image.pollinations.ai/prompt/{encoded_prompt}?model={model}&image={encoded_image}&nologo=true"
+    res = requests.get(url, timeout=60)
+    content_type = res.headers.get("content-type", "")
+    if res.status_code == 200 and content_type.startswith("image/"):
+        encoded = base64.b64encode(res.content).decode("utf-8")
+        return f"data:image/png;base64,{encoded}", None
+    return None, f"کد {res.status_code}: {res.text[:200]}"
+
+
+def _try_sensenova_model(model, resized_data_url, resized_bytes, prompt, headers):
+    """ویرایش عکس با SenseNova (سازگار با فرمت images/edits اوپن‌ای‌آی)"""
+    if not SENSENOVA_API_KEY:
+        return None, "کلید SenseNova روی سرور تنظیم نشده"
+
+    url = "https://token.sensenova.cn/v1/images/edits"
+    sn_headers = {"Authorization": f"Bearer {SENSENOVA_API_KEY}"}
+    files = {"image": ("image.png", resized_bytes, "image/png")}
+    data = {"prompt": prompt, "model": model}
+
+    res = requests.post(url, headers=sn_headers, files=files, data=data, timeout=60)
+    try:
+        result = res.json()
+    except Exception:
+        return None, res.text[:200]
+
+    items = result.get("data") or []
+    if items:
+        item = items[0]
+        if item.get("b64_json"):
+            return f"data:image/png;base64,{item['b64_json']}", None
+        if item.get("url"):
+            return item["url"], None
+
+    err = result.get("error", {})
+    msg = err.get("message", str(result)[:200]) if isinstance(err, dict) else str(result)[:200]
+    return None, msg
+
+
 _IMG2IMG_HANDLERS = {
+    "sensenova": _try_sensenova_model,
+    "pollinations": _try_pollinations_model,
     "huggingface": _try_huggingface_model,
     "gateway": _try_gateway_model,
     "native_b64": _try_native_b64_model,
