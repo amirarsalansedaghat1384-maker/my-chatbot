@@ -23,6 +23,7 @@ from docx import Document
 import openpyxl
 
 app = Flask(__name__)
+app.config["MAX_CONTENT_LENGTH"] = 12 * 1024 * 1024
 app.secret_key = os.environ.get("SECRET_KEY", "یه-رشته-تصادفی-برای-امنیت-عوضش-کن")
 
 API_KEY = os.environ.get("OPENROUTER_API_KEY")
@@ -65,413 +66,470 @@ PROVIDERS = {
 }
 DEFAULT_PROVIDER = "openrouter"
 
-
-# ==================== ساخت و ویرایش تصویر ====================
-
-import logging
-
-logger = logging.getLogger(__name__)
-
-# کلیدها فقط از متغیرهای محیطی Railway خوانده می‌شوند.
+# ---- ساخت و ویرایش عکس با Cloudflare Workers AI ----
 CF_ACCOUNT_ID = os.environ.get("CF_ACCOUNT_ID")
 CF_API_TOKEN = os.environ.get("CF_API_TOKEN")
 HF_API_KEY = os.environ.get("HF_API_KEY")
 SENSENOVA_API_KEY = os.environ.get("SENSENOVA_API_KEY")
-POLLINATIONS_API_KEY = os.environ.get("POLLINATIONS_API_KEY")
-
 CF_IMAGE_MODEL = "@cf/black-forest-labs/flux-1-schnell"
+CF_IMG2IMG_UNIVERSAL_URL = "https://api.cloudflare.com/client/v4/accounts/{account}/ai/run"
+CF_IMG2IMG_NATIVE_URL = "https://api.cloudflare.com/client/v4/accounts/{account}/ai/run/{model}"
 
-POLLINATIONS_EDIT_URL = (
-    "https://gen.pollinations.ai/v1/images/edits"
-)
-
-MAX_IMAGE_BYTES = 8 * 1024 * 1024
-IMAGE_TIMEOUT = (15, 120)
-MAX_IMAGE_SIDE = 1024
+# زنجیره‌ی مدل‌های ویرایش عکس - اگه یکی خطا داد (یا اعتبارش تموم شد)، خودکار میره سراغ بعدی
+IMG2IMG_CANDIDATES = [
+    {"model": "sensenova-u1.5-lite", "kind": "sensenova"},  # رایگان (دوره بتا) - نیاز به SENSENOVA_API_KEY
+    {"model": "kontext", "kind": "pollinations"},  # کاملاً رایگان، بدون کلید
+    {"model": "black-forest-labs/FLUX.1-Kontext-dev", "kind": "huggingface"},  # رایگان (سهمیه‌ی ماهانه محدود)
+    {"model": "bria/fibo-edit-1.5", "kind": "gateway"},  # پولی - فقط اگه حساب Cloudflare اعتبار داشته باشه
+    {"model": "@cf/stabilityai/stable-diffusion-xl-base-1.0", "kind": "native_b64"},
+    {"model": "@cf/bytedance/stable-diffusion-xl-lightning", "kind": "native_bytes"},
+    {"model": "@cf/runwayml/stable-diffusion-v1-5-img2img", "kind": "native_b64"},
+]
 
 IMAGE_GEN_TRIGGERS = [
-    "عکس بساز", "تصویر بساز", "یه عکس از", "یک عکس از",
-    "عکسی از", "نقاشی بکش", "نقاشی کن", "برام بکش",
-    "یه نقاشی از", "یک نقاشی از",
+    "عکس بساز", "تصویر بساز", "یه عکس از", "یک عکس از", "عکسی از",
+    "نقاشی بکش", "نقاشی کن", "برام بکش", "یه نقاشی از", "یک نقاشی از",
 ]
 
 IMAGE_EDIT_TRIGGERS = [
     "تغییر", "تبدیل", "ویرایش", "عوض", "رنگی", "رنگیش",
 ]
-
+# الگوهایی مثل «... رو سفید کن»، «... رو قرمز کن» و غیره
 IMAGE_EDIT_COLOR_PATTERN = re.compile(
-    r"(سفید|سیاه|قرمز|آبی|سبز|زرد|نارنجی|بنفش|صورتی|"
-    r"طلایی|خاکستری)\s*(ش)?\s*کن"
+    r"(سفید|سیاه|قرمز|آبی|سبز|زرد|نارنجی|بنفش|صورتی|طلایی|خاکستری)\s*(ش)?\s*کن"
 )
+
+SYSTEM_PROMPT = (
+    "تو یک دستیار هوش مصنوعی فارسی‌زبان هستی. همیشه فقط و فقط به زبان فارسی روان و "
+    "طبیعی پاسخ بده و هیچ کلمه یا جمله‌ای از زبان‌های دیگر (انگلیسی، اسپانیایی، رومانیایی و غیره) "
+    "قاطی جواب‌هات نکن، مگر اینکه کاربر مستقیم از تو بخواد یا اسم خاص/فنی باشه که معادل فارسی نداره. "
+    "برای فرمت‌بندی جواب‌هات از Markdown استاندارد استفاده کن: **متن پررنگ** برای تاکید، "
+    "لیست‌ها با - یا شماره، و تیترها در صورت نیاز. جواب‌هات رو تمیز، خوانا و مرتب بنویس."
+)
+
+HISTORY_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "chat_history.json")
+
+COOKIE_NAME = "user_id"
+COOKIE_MAX_AGE = 60 * 60 * 24 * 365 * 2  # دو سال
+
+MAX_DAILY_MESSAGES = 30  # محدودیت پیام رایگان روزانه برای هر کاربر
+MAX_DOC_CHARS = 12000  # حداکثر تعداد کاراکتری که از یه فایل استخراج می‌کنیم
+MAX_UPLOAD_SIZE = 8 * 1024 * 1024  # حداکثر حجم فایل آپلودی: ۸ مگابایت
+
+MEMORY_TRIGGERS = ["یادت باشه", "به خاطر بسپار", "فراموش نکن", "یادت بمونه", "حفظ کن که"]
+MAX_MEMORY_NOTES = 30  # حداکثر تعداد یادداشت حافظه برای هر کاربر
+
+ADMIN_PASSWORD = os.environ.get("ADMIN_PASSWORD", "admin123")
+
+
+def load_data():
+    if os.path.exists(HISTORY_FILE):
+        try:
+            with open(HISTORY_FILE, "r", encoding="utf-8") as f:
+                data = json.load(f)
+                if isinstance(data, dict) and isinstance(data.get("users"), dict):
+                    return data
+        except (json.JSONDecodeError, IOError):
+            pass
+    return {"users": {}}
+
+
+def save_data(data):
+    with open(HISTORY_FILE, "w", encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False, indent=2)
+
+
+data_store = load_data()
+
+
+def get_user_entry():
+    user_id = g.user_id
+    if user_id not in data_store["users"]:
+        data_store["users"][user_id] = {"chats": {}}
+    return data_store["users"][user_id]
+
+
+def get_user_chats():
+    return get_user_entry()["chats"]
+
+
+def get_user_memory():
+    entry = get_user_entry()
+    if "memory" not in entry:
+        entry["memory"] = []
+    return entry["memory"]
+
+
+def get_provider_config(user_entry):
+    """تنظیمات سرویس‌دهنده‌ی فعلی کاربر رو برمی‌گردونه: (api_key, url, model, supports_vision, error)"""
+    provider_id = user_entry.get("provider", DEFAULT_PROVIDER)
+    if provider_id not in PROVIDERS or not PROVIDERS[provider_id].get("api_key"):
+        if PROVIDERS.get(DEFAULT_PROVIDER, {}).get("api_key"):
+            provider_id = DEFAULT_PROVIDER
+        else:
+            provider_id = next((pid for pid, item in PROVIDERS.items() if item.get("api_key")), None)
+
+    if provider_id is None:
+        return None, None, None, None, "هیچ مدل فعالی روی سرور تنظیم نشده؛ حداقل یک کلید API معتبر در متغیرهای محیطی قرار بده."
+    provider = PROVIDERS[provider_id]
+
+    return provider["api_key"], provider["url"], provider["model"], provider["supports_vision"], None
+
+
+def check_memory_trigger(text):
+    """اگه پیام کاربر شامل یکی از عبارات یادآوری بود، اون رو به‌عنوان یادداشت حافظه برمی‌گردونه"""
+    for trigger in MEMORY_TRIGGERS:
+        if trigger in text:
+            return text.strip()
+    return None
+
+
+def add_memory_note(note):
+    notes = get_user_memory()
+    notes.append({"text": note, "created": time.time()})
+    if len(notes) > MAX_MEMORY_NOTES:
+        del notes[0]
+    save_data(data_store)
+
+
+def build_memory_context():
+    notes = get_user_memory()
+    if not notes:
+        return ""
+    lines = "\n".join(f"- {n['text']}" for n in notes)
+    return (
+        "\n\nچیزهایی که کاربر قبلاً ازت خواسته به خاطر بسپاری (در مکالمات قبلی):\n"
+        f"{lines}\n"
+        "این‌ها رو در نظر بگیر، ولی فقط وقتی مرتبطه ازشون استفاده کن."
+    )
+
+
+def extract_text_from_file(filename, file_bytes):
+    """متن رو از فایل PDF/Word/Excel/متنی استخراج می‌کنه"""
+    ext = filename.rsplit(".", 1)[-1].lower() if "." in filename else ""
+
+    try:
+        if ext == "pdf":
+            reader = PdfReader(io.BytesIO(file_bytes))
+            text = "\n".join((page.extract_text() or "") for page in reader.pages)
+        elif ext == "docx":
+            doc = Document(io.BytesIO(file_bytes))
+            text = "\n".join(p.text for p in doc.paragraphs)
+        elif ext in ("xlsx", "xlsm"):
+            wb = openpyxl.load_workbook(io.BytesIO(file_bytes), data_only=True)
+            parts = []
+            for sheet in wb.worksheets:
+                parts.append(f"--- شیت: {sheet.title} ---")
+                for row in sheet.iter_rows(values_only=True):
+                    line = " | ".join(str(cell) for cell in row if cell is not None)
+                    if line.strip():
+                        parts.append(line)
+            text = "\n".join(parts)
+        elif ext in ("txt", "csv", "md"):
+            text = file_bytes.decode("utf-8", errors="ignore")
+        elif ext == "doc":
+            return None, "فایل‌های Word با فرمت قدیمی (.doc) پشتیبانی نمی‌شن - لطفاً به .docx تبدیلش کن."
+        elif ext == "xls":
+            return None, "فایل‌های Excel با فرمت قدیمی (.xls) پشتیبانی نمی‌شن - لطفاً به .xlsx تبدیلش کن."
+        else:
+            return None, f"فرمت .{ext} پشتیبانی نمی‌شه."
+    except Exception as e:
+        return None, f"خطا در خوندن فایل: {str(e)}"
+
+    text = text.strip()
+    if not text:
+        return None, "متنی از این فایل استخراج نشد (ممکنه اسکن‌شده یا خالی باشه)."
+
+    truncated = len(text) > MAX_DOC_CHARS
+    if truncated:
+        text = text[:MAX_DOC_CHARS]
+
+    return text, ("truncated" if truncated else None)
+
+
+def make_title(first_message):
+    title = first_message.strip()
+    if len(title) > 30:
+        title = title[:30] + "..."
+    return title or "مکالمه جدید"
+
+
+def check_and_increment_usage():
+    """برمی‌گردونه: (مجاز است؟, پیام خطا در صورت رد شدن)"""
+    user_entry = get_user_entry()
+    today = datetime.date.today().isoformat()
+    usage = user_entry.setdefault("usage", {"date": today, "count": 0})
+    if usage["date"] != today:
+        usage["date"] = today
+        usage["count"] = 0
+    if usage["count"] >= MAX_DAILY_MESSAGES:
+        return False, f"محدودیت {MAX_DAILY_MESSAGES} پیام رایگان امروزت تموم شد. فردا دوباره امتحان کن."
+    usage["count"] += 1
+    save_data(data_store)
+    return True, None
+
+
+def build_content(user_message, image_data):
+    if image_data:
+        text_part = user_message or "این تصویر رو توضیح بده"
+        return [
+            {"type": "text", "text": text_part},
+            {"type": "image_url", "image_url": {"url": image_data}},
+        ]
+    return user_message
+
+
+def sanitize_messages_for_provider(messages, supports_vision):
+    """
+    اگه مدل انتخابی تصویر رو نمی‌فهمه، پیام‌های قدیمی که فرمت چندبخشی (متن+عکس) دارن
+    رو به متن ساده تبدیل می‌کنه تا API اون سرویس رد نکنه.
+    """
+    if supports_vision:
+        return messages
+
+    cleaned = []
+    for msg in messages:
+        content = msg.get("content")
+        if isinstance(content, list):
+            text_parts = [p.get("text", "") for p in content if p.get("type") == "text"]
+            has_image = any(p.get("type") == "image_url" for p in content)
+            text = " ".join(t for t in text_parts if t).strip()
+            if has_image:
+                text = (text + " [یک عکس همراه این پیام بود]").strip()
+            cleaned.append({"role": msg["role"], "content": text or "[عکس]"})
+        else:
+            cleaned.append(msg)
+    return cleaned
 
 
 def detect_image_generation_request(text):
-    text = (text or "").strip()
-    return any(trigger in text for trigger in IMAGE_GEN_TRIGGERS)
+    """اگه پیام کاربر درخواست ساخت عکس بود، True برمی‌گردونه"""
+    for trig in IMAGE_GEN_TRIGGERS:
+        if trig in text:
+            return True
+    return False
 
 
 def detect_image_edit_request(text):
-    text = (text or "").strip()
-    return (
-        any(trigger in text for trigger in IMAGE_EDIT_TRIGGERS)
-        or bool(IMAGE_EDIT_COLOR_PATTERN.search(text))
-    )
+    """اگه پیام کاربر (همراه با یه عکس آپلودشده) درخواست تغییر/ویرایش اون عکس بود، True برمی‌گردونه"""
+    for trig in IMAGE_EDIT_TRIGGERS:
+        if trig in text:
+            return True
+    if IMAGE_EDIT_COLOR_PATTERN.search(text):
+        return True
+    return False
 
 
 def translate_to_image_prompt(persian_text):
-    """تبدیل دستور فارسی به دستور مناسب مدل تصویر."""
+    """درخواست فارسی رو به یه پرامپت کوتاه و واضح انگلیسی تبدیل می‌کنه تا مدل تصویر بهتر بفهمدش"""
     if not API_KEY:
         return persian_text
-
     try:
-        response = requests.post(
-            API_URL,
-            headers={
-                "Authorization": f"Bearer {API_KEY}",
-                "Content-Type": "application/json",
-            },
-            json={
-                "model": MODEL,
-                "messages": [
-                    {
-                        "role": "system",
-                        "content": (
-                            "Translate the user's image editing or "
-                            "generation request into a concise English "
-                            "prompt. Preserve the intended changes and "
-                            "the identity and composition of the source "
-                            "image when editing. Return only the prompt."
-                        ),
-                    },
-                    {"role": "user", "content": persian_text},
-                ],
-            },
-            timeout=30,
-        )
-        response.raise_for_status()
-        result = response.json()
-        prompt = result["choices"][0]["message"]["content"].strip()
-        return prompt or persian_text
+        headers = {"Authorization": f"Bearer {API_KEY}", "content-type": "application/json"}
+        payload = {
+            "model": MODEL,
+            "messages": [
+                {
+                    "role": "system",
+                    "content": (
+                        "Translate the user's image request into a short, vivid English prompt "
+                        "suitable for an image generation model. Output ONLY the prompt itself, "
+                        "nothing else - no quotes, no explanation, no extra text."
+                    ),
+                },
+                {"role": "user", "content": persian_text},
+            ],
+        }
+        res = requests.post(API_URL, headers=headers, json=payload, timeout=30)
+        data = res.json()
+        translated = data["choices"][0]["message"]["content"].strip()
+        return translated or persian_text
     except Exception:
-        logger.exception("Image prompt translation failed")
-        return persian_text
+        return persian_text  # اگه ترجمه شکست خورد، همون متن اصلی رو بفرست
 
 
-def _decode_input_image(image_data_url):
-    """اعتبارسنجی، کوچک‌سازی و آماده‌سازی تصویر ورودی."""
-    if not isinstance(image_data_url, str):
-        raise ValueError("تصویر ورودی معتبر نیست.")
+def generate_image(prompt):
+    """یه عکس از روی prompt با Cloudflare Workers AI می‌سازه. برمی‌گردونه: (data_url, error)"""
+    if not CF_ACCOUNT_ID or not CF_API_TOKEN:
+        return None, "قابلیت ساخت عکس هنوز روی سرور فعال نشده (کلید Cloudflare تنظیم نشده)."
 
-    if not image_data_url.startswith("data:image/"):
-        raise ValueError("تصویر باید به شکل Data URL ارسال شود.")
-
-    try:
-        header, encoded = image_data_url.split(",", 1)
-        raw = base64.b64decode(encoded, validate=True)
-    except Exception as exc:
-        raise ValueError("رمزگذاری تصویر معتبر نیست.") from exc
-
-    if len(raw) > MAX_IMAGE_BYTES:
-        raise ValueError("حجم تصویر بیشتر از ۸ مگابایت است.")
+    url = f"https://api.cloudflare.com/client/v4/accounts/{CF_ACCOUNT_ID}/ai/run/{CF_IMAGE_MODEL}"
+    headers = {"Authorization": f"Bearer {CF_API_TOKEN}", "content-type": "application/json"}
 
     try:
-        with Image.open(io.BytesIO(raw)) as source:
-            if source.format not in ("PNG", "JPEG", "WEBP"):
-                raise ValueError("فرمت تصویر پشتیبانی نمی‌شود.")
+        res = requests.post(url, headers=headers, json={"prompt": prompt}, timeout=60)
+        data = res.json()
 
-            image = source.convert("RGB")
-            image.thumbnail((MAX_IMAGE_SIDE, MAX_IMAGE_SIDE))
+        if not data.get("success"):
+            errors = data.get("errors") or [{"message": "خطای نامشخص"}]
+            msg = errors[0].get("message", "خطای نامشخص")
+            return None, f"خطا در ساخت عکس: {msg}"
 
-            output = io.BytesIO()
-            image.save(output, format="PNG")
-            result = output.getvalue()
-    except ValueError:
-        raise
-    except Exception as exc:
-        raise ValueError("خواندن تصویر ورودی ناموفق بود.") from exc
+        b64_image = data["result"]["image"]
+        return f"data:image/png;base64,{b64_image}", None
 
-    return result
+    except Exception as e:
+        return None, f"خطا در ارتباط با سرویس ساخت عکس: {str(e)}"
 
 
-def _image_data_url(raw_bytes, mime="image/png"):
-    encoded = base64.b64encode(raw_bytes).decode("ascii")
-    return f"data:{mime};base64,{encoded}"
+def _try_gateway_model(model, resized_data_url, resized_bytes, prompt, headers):
+    """مدل‌های شخص‌ثالث (مثل bria/...) از مسیر یکپارچه‌ی جدید Cloudflare صدا زده می‌شن"""
+    if not CF_ACCOUNT_ID or not CF_API_TOKEN:
+        return None, "کلید Cloudflare تنظیم نشده"
+    url = CF_IMG2IMG_UNIVERSAL_URL.format(account=CF_ACCOUNT_ID)
+    payload = {"model": model, "input": {"images": [resized_data_url], "instruction": prompt}}
+    res = requests.post(url, headers=headers, json=payload, timeout=60)
+    data = res.json()
+    result = data.get("result", data) if isinstance(data, dict) else {}
+    image_url = result.get("image") if isinstance(result, dict) else None
+    if image_url:
+        return image_url, None
+    errors = data.get("errors") if isinstance(data, dict) else None
+    msg = errors[0].get("message", "خطای نامشخص") if errors else str(data)[:200]
+    return None, msg
 
 
-def _extract_api_error(response):
-    """استخراج خطای قابل‌فهم بدون ثبت کلیدهای محرمانه."""
-    try:
-        data = response.json()
-        error = data.get("error", data.get("errors", data))
-        if isinstance(error, list) and error:
-            error = error[0]
-        if isinstance(error, dict):
-            message = error.get("message") or str(error)
-        else:
-            message = str(error)
-    except Exception:
-        message = response.text[:500]
-
-    return f"HTTP {response.status_code}: {message[:500]}"
-
-
-def _try_pollinations_edit(image_bytes, prompt):
-    """
-    ویرایش از طریق API رسمی Pollinations.
-    به کلید POLLINATIONS_API_KEY نیاز دارد.
-    رایگان بودن درخواست به شرایط اعتبار حساب بستگی دارد.
-    """
-    if not POLLINATIONS_API_KEY:
-        raise RuntimeError(
-            "کلید POLLINATIONS_API_KEY تنظیم نشده است."
-        )
-
-    response = requests.post(
-        POLLINATIONS_EDIT_URL,
-        headers={
-            "Authorization": f"Bearer {POLLINATIONS_API_KEY}",
-            "Accept": "application/json",
-        },
-        files={
-            "image": ("source.png", image_bytes, "image/png"),
-        },
-        data={
-            "prompt": prompt,
-            "model": "kontext",
-            "size": "1024x1024",
-        },
-        timeout=IMAGE_TIMEOUT,
-    )
-
-    if not response.ok:
-        raise RuntimeError(_extract_api_error(response))
-
-    content_type = response.headers.get("Content-Type", "").lower()
-
-    # بعضی APIها مستقیماً فایل تصویر برمی‌گردانند.
+def _try_native_b64_model(model, resized_data_url, resized_bytes, prompt, headers):
+    """مدل‌های خود Cloudflare (@cf/...) که image_b64 قبول می‌کنن"""
+    if not CF_ACCOUNT_ID or not CF_API_TOKEN:
+        return None, "کلید Cloudflare تنظیم نشده"
+    b64_only = resized_data_url.split(",", 1)[1]
+    url = CF_IMG2IMG_NATIVE_URL.format(account=CF_ACCOUNT_ID, model=model)
+    payload = {"prompt": prompt, "image_b64": b64_only, "strength": 0.7}
+    res = requests.post(url, headers=headers, json=payload, timeout=60)
+    content_type = res.headers.get("content-type", "")
     if content_type.startswith("image/"):
-        if len(response.content) > 15 * 1024 * 1024:
-            raise RuntimeError("حجم تصویر خروجی بیش از حد مجاز است.")
-        try:
-            with Image.open(io.BytesIO(response.content)) as img:
-                img.verify()
-        except Exception as exc:
-            raise RuntimeError("تصویر خروجی معتبر نیست.") from exc
-
-        return _image_data_url(response.content)
-
-    # پاسخ JSON سازگار با API تصاویر OpenAI.
+        encoded = base64.b64encode(res.content).decode("utf-8")
+        return f"data:image/png;base64,{encoded}", None
     try:
-        data = response.json()
-        items = data.get("data", [])
-        if not items:
-            raise RuntimeError(
-                "پاسخ سرویس فاقد تصویر خروجی است."
-            )
-
-        item = items[0]
-
-        if item.get("b64_json"):
-            raw = base64.b64decode(item["b64_json"], validate=True)
-            with Image.open(io.BytesIO(raw)) as img:
-                img.verify()
-            return _image_data_url(raw)
-
-        if item.get("url"):
-            # برای جلوگیری از SSRF، URL خروجی را خودکار دریافت نمی‌کنیم.
-            # اگر سرویس URL برگرداند، باید دریافت آن جداگانه امن‌سازی شود.
-            raise RuntimeError(
-                "سرویس URL تصویر برگرداند، نه داده تصویر. "
-                "پاسخ API باید با فرمت b64_json تنظیم شود."
-            )
-
-    except RuntimeError:
-        raise
-    except Exception as exc:
-        raise RuntimeError(
-            "قالب پاسخ ویرایش تصویر قابل‌شناسایی نیست."
-        ) from exc
-
-    raise RuntimeError("تصویر خروجی در پاسخ سرویس یافت نشد.")
+        data = res.json()
+        errors = data.get("errors") or [{"message": "خطای نامشخص"}]
+        msg = errors[0].get("message", "خطای نامشخص")
+    except Exception:
+        msg = res.text[:200]
+    return None, msg
 
 
-def _try_huggingface_edit(image_bytes, prompt):
-    """
-    گزینه جایگزین Hugging Face.
-    ممکن است اعتبار مصرفی بخواهد و رایگان بودن دائمی تضمین نیست.
-    """
+def _try_native_bytes_model(model, resized_data_url, resized_bytes, prompt, headers):
+    """مدل‌های خود Cloudflare (@cf/...) که فقط آرایه‌ی بایت خام قبول می‌کنن"""
+    if not CF_ACCOUNT_ID or not CF_API_TOKEN:
+        return None, "کلید Cloudflare تنظیم نشده"
+    url = CF_IMG2IMG_NATIVE_URL.format(account=CF_ACCOUNT_ID, model=model)
+    payload = {"prompt": prompt, "image": list(resized_bytes), "strength": 0.7}
+    res = requests.post(url, headers=headers, json=payload, timeout=60)
+    content_type = res.headers.get("content-type", "")
+    if content_type.startswith("image/"):
+        encoded = base64.b64encode(res.content).decode("utf-8")
+        return f"data:image/png;base64,{encoded}", None
+    try:
+        data = res.json()
+        errors = data.get("errors") or [{"message": "خطای نامشخص"}]
+        msg = errors[0].get("message", "خطای نامشخص")
+    except Exception:
+        msg = res.text[:200]
+    return None, msg
+
+
+def _try_huggingface_model(model, resized_data_url, resized_bytes, prompt, headers):
+    """ویرایش عکس با Hugging Face Inference Providers (رایگان با سهمیه‌ی ماهانه‌ی محدود)"""
     if not HF_API_KEY:
-        raise RuntimeError("کلید HF_API_KEY تنظیم نشده است.")
-
-    client = InferenceClient(
-        provider="fal-ai",
-        api_key=HF_API_KEY,
-        timeout=120,
-    )
-
-    result = client.image_to_image(
-        image_bytes,
-        prompt=prompt,
-        model="black-forest-labs/FLUX.1-Kontext-dev",
-    )
-
-    output = io.BytesIO()
-    result.save(output, format="PNG")
-    return _image_data_url(output.getvalue())
+        return None, "کلید Hugging Face روی سرور تنظیم نشده"
+    client = InferenceClient(provider="fal-ai", api_key=HF_API_KEY)
+    result_image = client.image_to_image(resized_bytes, prompt=prompt, model=model)
+    buf = io.BytesIO()
+    result_image.save(buf, format="PNG")
+    encoded = base64.b64encode(buf.getvalue()).decode("utf-8")
+    return f"data:image/png;base64,{encoded}", None
 
 
-def _try_sensenova_edit(image_bytes, prompt):
-    """گزینه اختیاری SenseNova؛ نیازمند کلید و مجوز معتبر."""
+def _try_pollinations_model(model, resized_data_url, resized_bytes, prompt, headers):
+    """ویرایش عکس با Pollinations.ai (کاملاً رایگان، بدون نیاز به کلید)"""
+    encoded_prompt = url_quote(prompt)
+    encoded_image = url_quote(resized_data_url, safe="")
+    url = f"https://image.pollinations.ai/prompt/{encoded_prompt}?model={model}&image={encoded_image}&nologo=true"
+    res = requests.get(url, timeout=60)
+    content_type = res.headers.get("content-type", "")
+    if res.status_code == 200 and content_type.startswith("image/"):
+        encoded = base64.b64encode(res.content).decode("utf-8")
+        return f"data:image/png;base64,{encoded}", None
+    return None, f"کد {res.status_code}: {res.text[:200]}"
+
+
+def _try_sensenova_model(model, resized_data_url, resized_bytes, prompt, headers):
+    """ویرایش عکس با SenseNova (سازگار با فرمت images/edits اوپن‌ای‌آی)"""
     if not SENSENOVA_API_KEY:
-        raise RuntimeError("کلید SenseNova تنظیم نشده است.")
+        return None, "کلید SenseNova روی سرور تنظیم نشده"
 
-    response = requests.post(
-        "https://token.sensenova.cn/v1/images/edits",
-        headers={
-            "Authorization": f"Bearer {SENSENOVA_API_KEY}",
-        },
-        files={
-            "image": ("source.png", image_bytes, "image/png"),
-        },
-        data={
-            "prompt": prompt,
-            "model": "sensenova-u1.5-lite",
-        },
-        timeout=IMAGE_TIMEOUT,
-    )
+    url = "https://token.sensenova.cn/v1/images/edits"
+    sn_headers = {"Authorization": f"Bearer {SENSENOVA_API_KEY}"}
+    files = {"image": ("image.png", resized_bytes, "image/png")}
+    data = {"prompt": prompt, "model": model}
 
-    if not response.ok:
-        raise RuntimeError(_extract_api_error(response))
+    res = requests.post(url, headers=sn_headers, files=files, data=data, timeout=60)
+    try:
+        result = res.json()
+    except Exception:
+        return None, res.text[:200]
 
-    data = response.json()
-    items = data.get("data") or []
+    items = result.get("data") or []
+    if items:
+        item = items[0]
+        if item.get("b64_json"):
+            return f"data:image/png;base64,{item['b64_json']}", None
+        if item.get("url"):
+            return item["url"], None
 
-    if not items:
-        raise RuntimeError(
-            str(data.get("error", "تصویری برگردانده نشد"))[:500]
-        )
+    err = result.get("error", {})
+    msg = err.get("message", str(result)[:200]) if isinstance(err, dict) else str(result)[:200]
+    return None, msg
 
-    item = items[0]
 
-    if item.get("b64_json"):
-        raw = base64.b64decode(item["b64_json"], validate=True)
-        with Image.open(io.BytesIO(raw)) as img:
-            img.verify()
-        return _image_data_url(raw)
-
-    if item.get("url"):
-        # URL خارجی بدون بررسی دانلود نمی‌شود.
-        raise RuntimeError(
-            "سرویس URL تصویر برگرداند؛ دریافت امن آن نیازمند بررسی جداگانه است."
-        )
-
-    raise RuntimeError("تصویر خروجی معتبر نیست.")
+_IMG2IMG_HANDLERS = {
+    "sensenova": _try_sensenova_model,
+    "pollinations": _try_pollinations_model,
+    "huggingface": _try_huggingface_model,
+    "gateway": _try_gateway_model,
+    "native_b64": _try_native_b64_model,
+    "native_bytes": _try_native_bytes_model,
+}
 
 
 def edit_image(image_data_url, prompt):
     """
-    ویرایش تصویر با ترتیب مشخص و خطاهای قابل‌ردیابی.
-    این تابع مستقل از تنظیم بودن Cloudflare کار می‌کند.
+    یه عکس ورودی رو طبق یه دستور متنی تغییر می‌ده.
+    به‌ترتیب چند مدل مختلف رو امتحان می‌کنه؛ هر کدوم خطا داد، میره سراغ بعدی.
+    برمی‌گردونه: (image_url, error)
     """
+    # اول عکس را آماده می‌کنیم؛ سرویس‌های SenseNova / Hugging Face / Pollinations
+    # مستقل از Cloudflare هستند و نباید به وجود کلید Cloudflare وابسته باشند.
     try:
-        image_bytes = _decode_input_image(image_data_url)
-    except Exception as exc:
-        return None, f"خطا در تصویر ورودی: {exc}"
+        b64_data = image_data_url.split(",", 1)[1]
+        raw_bytes = base64.b64decode(b64_data)
+        img = Image.open(io.BytesIO(raw_bytes)).convert("RGB")
+        img.thumbnail((1024, 1024))
+        buf = io.BytesIO()
+        img.save(buf, format="PNG")
+        resized_bytes = buf.getvalue()
+        resized_b64 = base64.b64encode(resized_bytes).decode("utf-8")
+        resized_data_url = f"data:image/png;base64,{resized_b64}"
+    except Exception as e:
+        return None, f"خطا در پردازش عکس ورودی: {str(e)}"
 
-    # فقط ارائه‌دهنده‌هایی که کلیدشان تنظیم شده امتحان می‌شوند.
-    candidates = []
+    headers = {"Authorization": f"Bearer {CF_API_TOKEN or ''}", "content-type": "application/json"}
 
-    if POLLINATIONS_API_KEY:
-        candidates.append(("Pollinations", _try_pollinations_edit))
-
-    if HF_API_KEY:
-        candidates.append(("Hugging Face", _try_huggingface_edit))
-
-    if SENSENOVA_API_KEY:
-        candidates.append(("SenseNova", _try_sensenova_edit))
-
-    if not candidates:
-        return None, (
-            "هیچ سرویس ویرایش تصویر فعالی تنظیم نشده است. "
-            "در Railway حداقل یکی از این متغیرها را تنظیم کن: "
-            "POLLINATIONS_API_KEY، HF_API_KEY یا SENSENOVA_API_KEY."
-        )
-
-    errors = []
-
-    for name, handler in candidates:
+    errors_log = []
+    for candidate in IMG2IMG_CANDIDATES:
+        handler = _IMG2IMG_HANDLERS[candidate["kind"]]
         try:
-            result = handler(image_bytes, prompt)
-            if result:
-                logger.info("Image edit succeeded: %s", name)
-                return result, None
+            image_url, err = handler(candidate["model"], resized_data_url, resized_bytes, prompt, headers)
+            if image_url:
+                return image_url, None
+            errors_log.append(f"{candidate['model']}: {err}")
+        except Exception as e:
+            errors_log.append(f"{candidate['model']}: {str(e)}")
 
-            errors.append(f"{name}: خروجی خالی")
-        except Exception as exc:
-            # جزئیات فقط در گزارش سرور ثبت می‌شوند.
-            logger.warning(
-                "Image edit failed for %s: %s",
-                name,
-                str(exc)[:500],
-            )
-            errors.append(f"{name}: {str(exc)[:200]}")
-
-    return None, (
-        "ویرایش تصویر با هیچ‌یک از سرویس‌های فعال موفق نشد. "
-        + " | ".join(errors)
-    )
-
-
-def generate_image(prompt):
-    """
-    ساخت تصویر از متن با Cloudflare Workers AI.
-    این تابع برای ساخت تصویر است، نه ویرایش تصویر ورودی.
-    """
-    if not CF_ACCOUNT_ID or not CF_API_TOKEN:
-        return None, (
-            "ساخت تصویر فعال نیست؛ متغیرهای CF_ACCOUNT_ID "
-            "و CF_API_TOKEN را در Railway تنظیم کن."
-        )
-
-    url = (
-        "https://api.cloudflare.com/client/v4/accounts/"
-        f"{CF_ACCOUNT_ID}/ai/run/{CF_IMAGE_MODEL}"
-    )
-
-    try:
-        response = requests.post(
-            url,
-            headers={
-                "Authorization": f"Bearer {CF_API_TOKEN}",
-                "Content-Type": "application/json",
-            },
-            json={"prompt": prompt},
-            timeout=IMAGE_TIMEOUT,
-        )
-
-        if not response.ok:
-            return None, (
-                "خطا در ساخت تصویر: "
-                + _extract_api_error(response)
-            )
-
-        data = response.json()
-        result = data.get("result") or {}
-        b64 = result.get("image")
-
-        if not data.get("success") or not b64:
-            return None, "سرویس ساخت تصویر خروجی معتبری نداد."
-
-        raw = base64.b64decode(b64, validate=True)
-
-        with Image.open(io.BytesIO(raw)) as img:
-            img.verify()
-
-        return _image_data_url(raw), None
-
-    except Exception as exc:
-        logger.exception("Image generation failed")
-        return None, f"خطا در ساخت تصویر: {str(exc)[:300]}"
+    combined = " | ".join(errors_log)
+    return None, f"همه‌ی مدل‌های ویرایش عکس خطا دادن: {combined}"
 
 
 def prepare_chat(chat_id, user_chats, user_message):
@@ -556,7 +614,7 @@ def get_settings():
 @app.route("/settings", methods=["POST"])
 def update_settings():
     user_entry = get_user_entry()
-    body = request.json or {}
+    body = request.get_json(silent=True) or {}
 
     provider_id = body.get("provider")
     if provider_id:
@@ -601,7 +659,7 @@ def get_memory():
 
 @app.route("/memory", methods=["POST"])
 def add_memory_manual():
-    note = (request.json or {}).get("text", "").strip()
+    note = (request.get_json(silent=True) or {}).get("text", "").strip()
     if not note:
         return jsonify({"error": "متن نمی‌تونه خالی باشه"}), 400
     add_memory_note(note)
@@ -689,7 +747,7 @@ def delete_chat(chat_id):
 @app.route("/chats/<chat_id>/rename", methods=["POST"])
 def rename_chat(chat_id):
     user_chats = get_user_chats()
-    new_title = (request.json or {}).get("title", "").strip()
+    new_title = (request.get_json(silent=True) or {}).get("title", "").strip()
     if not new_title:
         return jsonify({"error": "اسم نمی‌تونه خالی باشه"}), 400
     if chat_id not in user_chats:
@@ -704,12 +762,17 @@ def chat():
     """نسخه غیر-استریم (پشتیبان/جایگزین)"""
     user_entry = get_user_entry()
     user_chats = user_entry["chats"]
-    chat_id = request.json.get("chat_id")
-    user_message = request.json.get("message", "").strip()
-    image_data = request.json.get("image")
+    body = request.get_json(silent=True) or {}
+    chat_id = body.get("chat_id")
+    user_message = (body.get("message") or "").strip()
+    image_data = body.get("image")
 
     if not user_message and not image_data:
         return jsonify({"error": "پیام خالی است"}), 400
+    if image_data and (not isinstance(image_data, str) or not image_data.startswith("data:image/")):
+        return jsonify({"error": "فرمت تصویر معتبر نیست؛ لطفاً تصویر را دوباره بارگذاری کن."}), 400
+    if image_data and len(image_data) > (MAX_UPLOAD_SIZE * 2):
+        return jsonify({"error": "حجم تصویر بیشتر از حد مجاز است؛ تصویر کوچک‌تری بفرست."}), 413
 
     provider_key, provider_url, provider_model, supports_vision, provider_err = get_provider_config(user_entry)
     if provider_err:
@@ -741,7 +804,11 @@ def chat():
         response_data = res.json()
 
         if res.status_code != 200:
-            error_msg = response_data.get("error", {}).get("message", str(response_data))
+            error_obj = response_data.get("error", {}) if isinstance(response_data, dict) else {}
+            if isinstance(error_obj, dict):
+                error_msg = error_obj.get("message", str(response_data))
+            else:
+                error_msg = str(error_obj or response_data)
             return jsonify({"error": f"خطا در ارتباط با API: {error_msg}"}), 500
 
         assistant_reply = response_data["choices"][0]["message"]["content"]
@@ -759,12 +826,17 @@ def chat_stream():
     """نسخه استریم - جواب رو به‌صورت تکه‌تکه (تایپ‌شونده) برمی‌گردونه"""
     user_entry = get_user_entry()
     user_chats = user_entry["chats"]
-    chat_id = request.json.get("chat_id")
-    user_message = request.json.get("message", "").strip()
-    image_data = request.json.get("image")
+    body = request.get_json(silent=True) or {}
+    chat_id = body.get("chat_id")
+    user_message = (body.get("message") or "").strip()
+    image_data = body.get("image")
 
     if not user_message and not image_data:
         return jsonify({"error": "پیام خالی است"}), 400
+    if image_data and (not isinstance(image_data, str) or not image_data.startswith("data:image/")):
+        return jsonify({"error": "فرمت تصویر معتبر نیست؛ لطفاً تصویر را دوباره بارگذاری کن."}), 400
+    if image_data and len(image_data) > (MAX_UPLOAD_SIZE * 2):
+        return jsonify({"error": "حجم تصویر بیشتر از حد مجاز است؛ تصویر کوچک‌تری بفرست."}), 413
 
     # اگه درخواست ساخت عکس بود (و خودش عکسی آپلود نکرده)، مسیر جدا از چت متنی می‌ره
     image_gen_requested = (not image_data) and detect_image_generation_request(user_message)
