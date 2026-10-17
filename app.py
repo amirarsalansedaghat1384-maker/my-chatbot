@@ -15,7 +15,6 @@ import io
 import base64
 from urllib.parse import quote as url_quote
 from PIL import Image
-from huggingface_hub import InferenceClient
 import re
 from functools import wraps
 from pypdf import PdfReader
@@ -23,7 +22,6 @@ from docx import Document
 import openpyxl
 
 app = Flask(__name__)
-app.config["MAX_CONTENT_LENGTH"] = 12 * 1024 * 1024
 app.secret_key = os.environ.get("SECRET_KEY", "یه-رشته-تصادفی-برای-امنیت-عوضش-کن")
 
 API_KEY = os.environ.get("OPENROUTER_API_KEY")
@@ -66,24 +64,19 @@ PROVIDERS = {
 }
 DEFAULT_PROVIDER = "openrouter"
 
-# ---- ساخت و ویرایش عکس با Cloudflare Workers AI ----
+# ---- ساخت عکس (جدا و دست‌نخورده) با Cloudflare Workers AI ----
 CF_ACCOUNT_ID = os.environ.get("CF_ACCOUNT_ID")
 CF_API_TOKEN = os.environ.get("CF_API_TOKEN")
-HF_API_KEY = os.environ.get("HF_API_KEY")
-SENSENOVA_API_KEY = os.environ.get("SENSENOVA_API_KEY")
 CF_IMAGE_MODEL = "@cf/black-forest-labs/flux-1-schnell"
-CF_IMG2IMG_UNIVERSAL_URL = "https://api.cloudflare.com/client/v4/accounts/{account}/ai/run"
-CF_IMG2IMG_NATIVE_URL = "https://api.cloudflare.com/client/v4/accounts/{account}/ai/run/{model}"
+
+# ---- ویرایش عکس ----
+SENSENOVA_API_KEY = os.environ.get("SENSENOVA_API_KEY")
+POLLINATIONS_API_KEY = os.environ.get("POLLINATIONS_API_KEY")
 
 # زنجیره‌ی مدل‌های ویرایش عکس - اگه یکی خطا داد (یا اعتبارش تموم شد)، خودکار میره سراغ بعدی
 IMG2IMG_CANDIDATES = [
     {"model": "sensenova-u1.5-lite", "kind": "sensenova"},  # رایگان (دوره بتا) - نیاز به SENSENOVA_API_KEY
-    {"model": "kontext", "kind": "pollinations"},  # کاملاً رایگان، بدون کلید
-    {"model": "black-forest-labs/FLUX.1-Kontext-dev", "kind": "huggingface"},  # رایگان (سهمیه‌ی ماهانه محدود)
-    {"model": "bria/fibo-edit-1.5", "kind": "gateway"},  # پولی - فقط اگه حساب Cloudflare اعتبار داشته باشه
-    {"model": "@cf/stabilityai/stable-diffusion-xl-base-1.0", "kind": "native_b64"},
-    {"model": "@cf/bytedance/stable-diffusion-xl-lightning", "kind": "native_bytes"},
-    {"model": "@cf/runwayml/stable-diffusion-v1-5-img2img", "kind": "native_b64"},
+    {"model": "kontext", "kind": "pollinations"},  # رایگان - نیاز به POLLINATIONS_API_KEY
 ]
 
 IMAGE_GEN_TRIGGERS = [
@@ -127,7 +120,7 @@ def load_data():
         try:
             with open(HISTORY_FILE, "r", encoding="utf-8") as f:
                 data = json.load(f)
-                if isinstance(data, dict) and isinstance(data.get("users"), dict):
+                if "users" in data:
                     return data
         except (json.JSONDecodeError, IOError):
             pass
@@ -163,15 +156,12 @@ def get_user_memory():
 def get_provider_config(user_entry):
     """تنظیمات سرویس‌دهنده‌ی فعلی کاربر رو برمی‌گردونه: (api_key, url, model, supports_vision, error)"""
     provider_id = user_entry.get("provider", DEFAULT_PROVIDER)
-    if provider_id not in PROVIDERS or not PROVIDERS[provider_id].get("api_key"):
-        if PROVIDERS.get(DEFAULT_PROVIDER, {}).get("api_key"):
-            provider_id = DEFAULT_PROVIDER
-        else:
-            provider_id = next((pid for pid, item in PROVIDERS.items() if item.get("api_key")), None)
+    if provider_id not in PROVIDERS or not PROVIDERS[provider_id]["api_key"]:
+        provider_id = DEFAULT_PROVIDER
 
-    if provider_id is None:
-        return None, None, None, None, "هیچ مدل فعالی روی سرور تنظیم نشده؛ حداقل یک کلید API معتبر در متغیرهای محیطی قرار بده."
     provider = PROVIDERS[provider_id]
+    if not provider["api_key"]:
+        return None, None, None, None, "هیچ مدلی روی سرور فعال نیست - باید کلید API حداقل یکی رو تنظیم کنی."
 
     return provider["api_key"], provider["url"], provider["model"], provider["supports_vision"], None
 
@@ -265,7 +255,6 @@ def check_and_increment_usage():
     if usage["count"] >= MAX_DAILY_MESSAGES:
         return False, f"محدودیت {MAX_DAILY_MESSAGES} پیام رایگان امروزت تموم شد. فردا دوباره امتحان کن."
     usage["count"] += 1
-    save_data(data_store)
     return True, None
 
 
@@ -372,95 +361,12 @@ def generate_image(prompt):
         return None, f"خطا در ارتباط با سرویس ساخت عکس: {str(e)}"
 
 
-def _try_gateway_model(model, resized_data_url, resized_bytes, prompt, headers):
-    """مدل‌های شخص‌ثالث (مثل bria/...) از مسیر یکپارچه‌ی جدید Cloudflare صدا زده می‌شن"""
-    if not CF_ACCOUNT_ID or not CF_API_TOKEN:
-        return None, "کلید Cloudflare تنظیم نشده"
-    url = CF_IMG2IMG_UNIVERSAL_URL.format(account=CF_ACCOUNT_ID)
-    payload = {"model": model, "input": {"images": [resized_data_url], "instruction": prompt}}
-    res = requests.post(url, headers=headers, json=payload, timeout=60)
-    data = res.json()
-    result = data.get("result", data) if isinstance(data, dict) else {}
-    image_url = result.get("image") if isinstance(result, dict) else None
-    if image_url:
-        return image_url, None
-    errors = data.get("errors") if isinstance(data, dict) else None
-    msg = errors[0].get("message", "خطای نامشخص") if errors else str(data)[:200]
-    return None, msg
-
-
-def _try_native_b64_model(model, resized_data_url, resized_bytes, prompt, headers):
-    """مدل‌های خود Cloudflare (@cf/...) که image_b64 قبول می‌کنن"""
-    if not CF_ACCOUNT_ID or not CF_API_TOKEN:
-        return None, "کلید Cloudflare تنظیم نشده"
-    b64_only = resized_data_url.split(",", 1)[1]
-    url = CF_IMG2IMG_NATIVE_URL.format(account=CF_ACCOUNT_ID, model=model)
-    payload = {"prompt": prompt, "image_b64": b64_only, "strength": 0.7}
-    res = requests.post(url, headers=headers, json=payload, timeout=60)
-    content_type = res.headers.get("content-type", "")
-    if content_type.startswith("image/"):
-        encoded = base64.b64encode(res.content).decode("utf-8")
-        return f"data:image/png;base64,{encoded}", None
-    try:
-        data = res.json()
-        errors = data.get("errors") or [{"message": "خطای نامشخص"}]
-        msg = errors[0].get("message", "خطای نامشخص")
-    except Exception:
-        msg = res.text[:200]
-    return None, msg
-
-
-def _try_native_bytes_model(model, resized_data_url, resized_bytes, prompt, headers):
-    """مدل‌های خود Cloudflare (@cf/...) که فقط آرایه‌ی بایت خام قبول می‌کنن"""
-    if not CF_ACCOUNT_ID or not CF_API_TOKEN:
-        return None, "کلید Cloudflare تنظیم نشده"
-    url = CF_IMG2IMG_NATIVE_URL.format(account=CF_ACCOUNT_ID, model=model)
-    payload = {"prompt": prompt, "image": list(resized_bytes), "strength": 0.7}
-    res = requests.post(url, headers=headers, json=payload, timeout=60)
-    content_type = res.headers.get("content-type", "")
-    if content_type.startswith("image/"):
-        encoded = base64.b64encode(res.content).decode("utf-8")
-        return f"data:image/png;base64,{encoded}", None
-    try:
-        data = res.json()
-        errors = data.get("errors") or [{"message": "خطای نامشخص"}]
-        msg = errors[0].get("message", "خطای نامشخص")
-    except Exception:
-        msg = res.text[:200]
-    return None, msg
-
-
-def _try_huggingface_model(model, resized_data_url, resized_bytes, prompt, headers):
-    """ویرایش عکس با Hugging Face Inference Providers (رایگان با سهمیه‌ی ماهانه‌ی محدود)"""
-    if not HF_API_KEY:
-        return None, "کلید Hugging Face روی سرور تنظیم نشده"
-    client = InferenceClient(provider="fal-ai", api_key=HF_API_KEY)
-    result_image = client.image_to_image(resized_bytes, prompt=prompt, model=model)
-    buf = io.BytesIO()
-    result_image.save(buf, format="PNG")
-    encoded = base64.b64encode(buf.getvalue()).decode("utf-8")
-    return f"data:image/png;base64,{encoded}", None
-
-
-def _try_pollinations_model(model, resized_data_url, resized_bytes, prompt, headers):
-    """ویرایش عکس با Pollinations.ai (کاملاً رایگان، بدون نیاز به کلید)"""
-    encoded_prompt = url_quote(prompt)
-    encoded_image = url_quote(resized_data_url, safe="")
-    url = f"https://image.pollinations.ai/prompt/{encoded_prompt}?model={model}&image={encoded_image}&nologo=true"
-    res = requests.get(url, timeout=60)
-    content_type = res.headers.get("content-type", "")
-    if res.status_code == 200 and content_type.startswith("image/"):
-        encoded = base64.b64encode(res.content).decode("utf-8")
-        return f"data:image/png;base64,{encoded}", None
-    return None, f"کد {res.status_code}: {res.text[:200]}"
-
-
 def _try_sensenova_model(model, resized_data_url, resized_bytes, prompt, headers):
-    """ویرایش عکس با SenseNova (سازگار با فرمت images/edits اوپن‌ای‌آی)"""
+    """ویرایش عکس با SenseNova (سازگار با فرمت images/edits اوپن‌ای‌آی، سرور بین‌المللی)"""
     if not SENSENOVA_API_KEY:
         return None, "کلید SenseNova روی سرور تنظیم نشده"
 
-    url = "https://token.sensenova.cn/v1/images/edits"
+    url = "https://token.sensenova.ai/v1/images/edits"
     sn_headers = {"Authorization": f"Bearer {SENSENOVA_API_KEY}"}
     files = {"image": ("image.png", resized_bytes, "image/png")}
     data = {"prompt": prompt, "model": model}
@@ -469,7 +375,7 @@ def _try_sensenova_model(model, resized_data_url, resized_bytes, prompt, headers
     try:
         result = res.json()
     except Exception:
-        return None, res.text[:200]
+        return None, f"کد {res.status_code}: {res.text[:200]}"
 
     items = result.get("data") or []
     if items:
@@ -484,13 +390,27 @@ def _try_sensenova_model(model, resized_data_url, resized_bytes, prompt, headers
     return None, msg
 
 
+def _try_pollinations_model(model, resized_data_url, resized_bytes, prompt, headers):
+    """ویرایش عکس با Pollinations.ai (دامنه‌ی جدید gen.pollinations.ai، نیاز به کلید sk_)"""
+    if not POLLINATIONS_API_KEY:
+        return None, "کلید Pollinations روی سرور تنظیم نشده"
+
+    encoded_prompt = url_quote(prompt)
+    encoded_image = url_quote(resized_data_url, safe="")
+    url = f"https://gen.pollinations.ai/image/{encoded_prompt}?model={model}&image={encoded_image}&nologo=true"
+    poll_headers = {"Authorization": f"Bearer {POLLINATIONS_API_KEY}"}
+
+    res = requests.get(url, headers=poll_headers, timeout=60)
+    content_type = res.headers.get("content-type", "")
+    if res.status_code == 200 and content_type.startswith("image/"):
+        encoded = base64.b64encode(res.content).decode("utf-8")
+        return f"data:image/png;base64,{encoded}", None
+    return None, f"کد {res.status_code}: {res.text[:200]}"
+
+
 _IMG2IMG_HANDLERS = {
     "sensenova": _try_sensenova_model,
     "pollinations": _try_pollinations_model,
-    "huggingface": _try_huggingface_model,
-    "gateway": _try_gateway_model,
-    "native_b64": _try_native_b64_model,
-    "native_bytes": _try_native_bytes_model,
 }
 
 
@@ -500,8 +420,10 @@ def edit_image(image_data_url, prompt):
     به‌ترتیب چند مدل مختلف رو امتحان می‌کنه؛ هر کدوم خطا داد، میره سراغ بعدی.
     برمی‌گردونه: (image_url, error)
     """
-    # اول عکس را آماده می‌کنیم؛ سرویس‌های SenseNova / Hugging Face / Pollinations
-    # مستقل از Cloudflare هستند و نباید به وجود کلید Cloudflare وابسته باشند.
+    if not CF_ACCOUNT_ID or not CF_API_TOKEN:
+        return None, "قابلیت ویرایش عکس هنوز روی سرور فعال نشده (کلید Cloudflare تنظیم نشده)."
+
+    # کوچیک کردن عکس قبل از ارسال تا حجم درخواست زیاد نشه
     try:
         b64_data = image_data_url.split(",", 1)[1]
         raw_bytes = base64.b64decode(b64_data)
@@ -515,7 +437,7 @@ def edit_image(image_data_url, prompt):
     except Exception as e:
         return None, f"خطا در پردازش عکس ورودی: {str(e)}"
 
-    headers = {"Authorization": f"Bearer {CF_API_TOKEN or ''}", "content-type": "application/json"}
+    headers = {"Authorization": f"Bearer {CF_API_TOKEN}", "content-type": "application/json"}
 
     errors_log = []
     for candidate in IMG2IMG_CANDIDATES:
@@ -614,7 +536,7 @@ def get_settings():
 @app.route("/settings", methods=["POST"])
 def update_settings():
     user_entry = get_user_entry()
-    body = request.get_json(silent=True) or {}
+    body = request.json or {}
 
     provider_id = body.get("provider")
     if provider_id:
@@ -659,7 +581,7 @@ def get_memory():
 
 @app.route("/memory", methods=["POST"])
 def add_memory_manual():
-    note = (request.get_json(silent=True) or {}).get("text", "").strip()
+    note = (request.json or {}).get("text", "").strip()
     if not note:
         return jsonify({"error": "متن نمی‌تونه خالی باشه"}), 400
     add_memory_note(note)
@@ -747,7 +669,7 @@ def delete_chat(chat_id):
 @app.route("/chats/<chat_id>/rename", methods=["POST"])
 def rename_chat(chat_id):
     user_chats = get_user_chats()
-    new_title = (request.get_json(silent=True) or {}).get("title", "").strip()
+    new_title = (request.json or {}).get("title", "").strip()
     if not new_title:
         return jsonify({"error": "اسم نمی‌تونه خالی باشه"}), 400
     if chat_id not in user_chats:
@@ -762,17 +684,12 @@ def chat():
     """نسخه غیر-استریم (پشتیبان/جایگزین)"""
     user_entry = get_user_entry()
     user_chats = user_entry["chats"]
-    body = request.get_json(silent=True) or {}
-    chat_id = body.get("chat_id")
-    user_message = (body.get("message") or "").strip()
-    image_data = body.get("image")
+    chat_id = request.json.get("chat_id")
+    user_message = request.json.get("message", "").strip()
+    image_data = request.json.get("image")
 
     if not user_message and not image_data:
         return jsonify({"error": "پیام خالی است"}), 400
-    if image_data and (not isinstance(image_data, str) or not image_data.startswith("data:image/")):
-        return jsonify({"error": "فرمت تصویر معتبر نیست؛ لطفاً تصویر را دوباره بارگذاری کن."}), 400
-    if image_data and len(image_data) > (MAX_UPLOAD_SIZE * 2):
-        return jsonify({"error": "حجم تصویر بیشتر از حد مجاز است؛ تصویر کوچک‌تری بفرست."}), 413
 
     provider_key, provider_url, provider_model, supports_vision, provider_err = get_provider_config(user_entry)
     if provider_err:
@@ -804,11 +721,7 @@ def chat():
         response_data = res.json()
 
         if res.status_code != 200:
-            error_obj = response_data.get("error", {}) if isinstance(response_data, dict) else {}
-            if isinstance(error_obj, dict):
-                error_msg = error_obj.get("message", str(response_data))
-            else:
-                error_msg = str(error_obj or response_data)
+            error_msg = response_data.get("error", {}).get("message", str(response_data))
             return jsonify({"error": f"خطا در ارتباط با API: {error_msg}"}), 500
 
         assistant_reply = response_data["choices"][0]["message"]["content"]
@@ -826,17 +739,12 @@ def chat_stream():
     """نسخه استریم - جواب رو به‌صورت تکه‌تکه (تایپ‌شونده) برمی‌گردونه"""
     user_entry = get_user_entry()
     user_chats = user_entry["chats"]
-    body = request.get_json(silent=True) or {}
-    chat_id = body.get("chat_id")
-    user_message = (body.get("message") or "").strip()
-    image_data = body.get("image")
+    chat_id = request.json.get("chat_id")
+    user_message = request.json.get("message", "").strip()
+    image_data = request.json.get("image")
 
     if not user_message and not image_data:
         return jsonify({"error": "پیام خالی است"}), 400
-    if image_data and (not isinstance(image_data, str) or not image_data.startswith("data:image/")):
-        return jsonify({"error": "فرمت تصویر معتبر نیست؛ لطفاً تصویر را دوباره بارگذاری کن."}), 400
-    if image_data and len(image_data) > (MAX_UPLOAD_SIZE * 2):
-        return jsonify({"error": "حجم تصویر بیشتر از حد مجاز است؛ تصویر کوچک‌تری بفرست."}), 413
 
     # اگه درخواست ساخت عکس بود (و خودش عکسی آپلود نکرده)، مسیر جدا از چت متنی می‌ره
     image_gen_requested = (not image_data) and detect_image_generation_request(user_message)
