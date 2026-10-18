@@ -414,6 +414,81 @@ _IMG2IMG_HANDLERS = {
 }
 
 
+# ---- تغییر رنگ محلی (بدون هوش مصنوعی) ----
+COLOR_NAMES = {
+    "سفید": (255, 255, 255),
+    "سیاه": (0, 0, 0),
+    "قرمز": (255, 0, 0),
+    "آبی": (0, 90, 255),
+    "سبز": (0, 170, 60),
+    "زرد": (255, 220, 0),
+    "نارنجی": (255, 140, 0),
+    "بنفش": (130, 60, 220),
+    "صورتی": (255, 105, 180),
+    "طلایی": (212, 175, 55),
+    "خاکستری": (128, 128, 128),
+}
+
+
+def parse_color_request(text):
+    """رنگ‌های ذکرشده در متن رو به ترتیب پیدا می‌کنه. برمی‌گردونه: (source_rgb یا None, target_rgb) یا None"""
+    found = []
+    for name in COLOR_NAMES:
+        for m in re.finditer(name, text):
+            found.append((m.start(), name))
+    if not found:
+        return None
+    found.sort()
+    names = [n for _, n in found]
+    if len(names) >= 2 and names[0] != names[-1]:
+        return COLOR_NAMES[names[0]], COLOR_NAMES[names[-1]]
+    return None, COLOR_NAMES[names[-1]]
+
+
+def recolor_image(image_data_url, text, tolerance=80):
+    """
+    رنگ یک ناحیه‌ی تصویر رو عوض می‌کنه (جایگزینی رنگ با لبه‌های نرم).
+    - اگه کاربر دو رنگ گفته («سفید رو قرمز کن»): اولی مبدأ، آخری مقصد
+    - اگه یک رنگ گفته («قرمز کن»): مقصد اونه؛ مبدأ خودکار پیدا می‌شه
+      (پیش‌زمینه = رنگ کم‌حجم‌تر، و اگه نوشته «پس‌زمینه» = رنگ پرحجم‌تر)
+    برمی‌گردونه: (data_url, error). اگه دستور قابل‌فهم نبود: (None, None)
+    """
+    import numpy as np
+
+    parsed = parse_color_request(text)
+    if not parsed:
+        return None, None
+    source_rgb, target_rgb = parsed
+
+    try:
+        b64_data = image_data_url.split(",", 1)[1]
+        img = Image.open(io.BytesIO(base64.b64decode(b64_data))).convert("RGB")
+        img.thumbnail((2048, 2048))
+
+        if source_rgb is None:
+            q = img.quantize(colors=2)
+            counts = sorted(q.getcolors(), reverse=True)  # [(تعداد, اندیس), ...]
+            palette = q.getpalette()
+            want_background = "پس‌زمینه" in text or "پس زمینه" in text or "پسزمینه" in text
+            idx = counts[0][1] if (want_background or len(counts) == 1) else counts[-1][1]
+            source_rgb = tuple(palette[idx * 3: idx * 3 + 3])
+
+        arr = np.asarray(img).astype(np.float32)
+        src = np.array(source_rgb, dtype=np.float32)
+        dst = np.array(target_rgb, dtype=np.float32)
+
+        dist = np.sqrt(((arr - src) ** 2).sum(axis=2))
+        # داخل ناحیه وزن ۱، در لبه‌ها کم‌کم صفر می‌شه (برای نرم موندن لبه‌ها)
+        weight = np.clip((tolerance - dist) / (tolerance * 0.6), 0, 1)[..., None]
+        out = np.clip(arr + weight * (dst - src), 0, 255).astype(np.uint8)
+
+        buf = io.BytesIO()
+        Image.fromarray(out).save(buf, format="PNG")
+        return "data:image/png;base64," + base64.b64encode(buf.getvalue()).decode("utf-8"), None
+    except Exception as e:
+        return None, f"خطا در تغییر رنگ: {str(e)}"
+
+
 def edit_image(image_data_url, prompt):
     """
     یه عکس ورودی رو طبق یه دستور متنی تغییر می‌ده.
@@ -788,8 +863,11 @@ def chat_stream():
 
     if image_edit_requested:
         def edit_image_stream():
-            english_prompt = translate_to_image_prompt(user_message)
-            img_url, err = edit_image(image_data, english_prompt)
+            # اول تغییر رنگ محلی (سریع و دقیق)، اگه دستور رنگی نبود برو سراغ مدل‌های AI
+            img_url, err = recolor_image(image_data, user_message)
+            if not img_url and not err:
+                english_prompt = translate_to_image_prompt(user_message)
+                img_url, err = edit_image(image_data, english_prompt)
             if err:
                 yield f"data: {json.dumps({'error': err})}\n\n"
             else:
