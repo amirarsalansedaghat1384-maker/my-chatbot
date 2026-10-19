@@ -71,12 +71,12 @@ CF_IMAGE_MODEL = "@cf/black-forest-labs/flux-1-schnell"
 
 # ---- ویرایش عکس ----
 SENSENOVA_API_KEY = os.environ.get("SENSENOVA_API_KEY")
-POLLINATIONS_API_KEY = os.environ.get("POLLINATIONS_API_KEY")
+CF_IMG2IMG_MODEL = "@cf/runwayml/stable-diffusion-v1-5-img2img"
 
 # زنجیره‌ی مدل‌های ویرایش عکس - اگه یکی خطا داد (یا اعتبارش تموم شد)، خودکار میره سراغ بعدی
 IMG2IMG_CANDIDATES = [
     {"model": "sensenova-u1.5-lite", "kind": "sensenova"},  # رایگان (دوره بتا) - نیاز به SENSENOVA_API_KEY
-    {"model": "kontext", "kind": "pollinations"},  # رایگان - نیاز به POLLINATIONS_API_KEY
+    {"model": CF_IMG2IMG_MODEL, "kind": "cloudflare"},  # رایگان - از همون کلید Cloudflare ساخت عکس استفاده می‌کنه
 ]
 
 IMAGE_GEN_TRIGGERS = [
@@ -84,13 +84,23 @@ IMAGE_GEN_TRIGGERS = [
     "نقاشی بکش", "نقاشی کن", "برام بکش", "یه نقاشی از", "یک نقاشی از",
 ]
 
-IMAGE_EDIT_TRIGGERS = [
-    "تغییر", "تبدیل", "ویرایش", "عوض", "رنگی", "رنگیش",
+# استایل‌های آماده برای ویرایش عکس: (کلمات کلیدی فارسی، پرامپت انگلیسی، قدرت تغییر بین ۰ تا ۱)
+STYLE_PRESETS = [
+    (["انیمه", "انیمیشن ژاپنی", "مانگا"],
+     "anime style illustration of the same person, same pose and composition, clean lineart, cel shading, vibrant colors, high quality", 0.65),
+    (["کارتون", "پیکسار", "انیمیشنی"],
+     "cartoon style illustration of the same person, same pose and composition, smooth shading, bold outlines, vibrant colors, 3d animated movie look", 0.65),
+    (["آبرنگ"],
+     "watercolor painting of the same scene, soft washes, paper texture, delicate brush strokes", 0.7),
+    (["رنگ روغن", "نقاشی"],
+     "oil painting of the same scene, visible brush strokes, rich colors, artistic, detailed canvas texture", 0.65),
+    (["اسکچ", "طراحی", "مدادی", "سیاه قلم"],
+     "pencil sketch of the same scene, graphite drawing, detailed hand-drawn lines, shading on white paper", 0.75),
+    (["پیکسل"],
+     "pixel art version of the same scene, 16-bit retro game style, limited color palette", 0.75),
 ]
-# الگوهایی مثل «... رو سفید کن»، «... رو قرمز کن» و غیره
-IMAGE_EDIT_COLOR_PATTERN = re.compile(
-    r"(سفید|سیاه|قرمز|آبی|سبز|زرد|نارنجی|بنفش|صورتی|طلایی|خاکستری)\s*(ش)?\s*کن"
-)
+IMAGE_EDIT_VERBS = ["کن", "بکن", "بساز", "بشه", "تبدیل", "تغییر", "ویرایش", "عوض", "بکش"]
+GRAYSCALE_WORDS = ["سیاه سفید", "سیاه و سفید", "سیاه‌وسفید", "سیاه‌ و‌ سفید", "خاکستری"]
 
 SYSTEM_PROMPT = (
     "تو یک دستیار هوش مصنوعی فارسی‌زبان هستی. همیشه فقط و فقط به زبان فارسی روان و "
@@ -300,13 +310,41 @@ def detect_image_generation_request(text):
 
 
 def detect_image_edit_request(text):
-    """اگه پیام کاربر (همراه با یه عکس آپلودشده) درخواست تغییر/ویرایش اون عکس بود، True برمی‌گردونه"""
-    for trig in IMAGE_EDIT_TRIGGERS:
-        if trig in text:
-            return True
-    if IMAGE_EDIT_COLOR_PATTERN.search(text):
+    """اگه پیام کاربر (همراه با یه عکس آپلودشده) درخواست تغییر استایل اون عکس بود، True برمی‌گردونه"""
+    has_verb = any(v in text for v in IMAGE_EDIT_VERBS)
+    if not has_verb:
+        return False
+    if any(w in text for w in GRAYSCALE_WORDS):
         return True
+    for keywords, _prompt, _strength in STYLE_PRESETS:
+        if any(k in text for k in keywords):
+            return True
     return False
+
+
+def match_style_preset(text):
+    """اگه استایل آماده‌ای تو متن بود (prompt, strength) برمی‌گردونه، وگرنه None"""
+    for keywords, prompt, strength in STYLE_PRESETS:
+        if any(k in text for k in keywords):
+            return prompt, strength
+    return None
+
+
+def is_grayscale_request(text):
+    return any(w in text for w in GRAYSCALE_WORDS)
+
+
+def make_grayscale(image_data_url):
+    """عکس رو سیاه‌وسفید می‌کنه (بدون هوش مصنوعی، فوری و دقیق). برمی‌گردونه: (data_url, error)"""
+    try:
+        b64_data = image_data_url.split(",", 1)[1]
+        img = Image.open(io.BytesIO(base64.b64decode(b64_data))).convert("L")
+        img.thumbnail((2048, 2048))
+        buf = io.BytesIO()
+        img.save(buf, format="PNG")
+        return "data:image/png;base64," + base64.b64encode(buf.getvalue()).decode("utf-8"), None
+    except Exception as e:
+        return None, f"خطا در سیاه‌وسفید کردن عکس: {str(e)}"
 
 
 def translate_to_image_prompt(persian_text):
@@ -361,7 +399,7 @@ def generate_image(prompt):
         return None, f"خطا در ارتباط با سرویس ساخت عکس: {str(e)}"
 
 
-def _try_sensenova_model(model, resized_data_url, resized_bytes, prompt, headers):
+def _try_sensenova_model(model, resized_data_url, resized_bytes, prompt, headers, strength=0.65):
     """ویرایش عکس با SenseNova (سازگار با فرمت images/edits اوپن‌ای‌آی، سرور بین‌المللی)"""
     if not SENSENOVA_API_KEY:
         return None, "کلید SenseNova روی سرور تنظیم نشده"
@@ -390,114 +428,47 @@ def _try_sensenova_model(model, resized_data_url, resized_bytes, prompt, headers
     return None, msg
 
 
-def _try_pollinations_model(model, resized_data_url, resized_bytes, prompt, headers):
-    """ویرایش عکس با Pollinations.ai (دامنه‌ی جدید gen.pollinations.ai، نیاز به کلید sk_)"""
-    if not POLLINATIONS_API_KEY:
-        return None, "کلید Pollinations روی سرور تنظیم نشده"
+def _try_cloudflare_img2img(model, resized_data_url, resized_bytes, prompt, headers, strength=0.65):
+    """تبدیل استایل عکس با Stable Diffusion img2img روی Cloudflare Workers AI"""
+    if not CF_ACCOUNT_ID or not CF_API_TOKEN:
+        return None, "کلید Cloudflare روی سرور تنظیم نشده"
 
-    encoded_prompt = url_quote(prompt)
-    encoded_image = url_quote(resized_data_url, safe="")
-    url = f"https://gen.pollinations.ai/image/{encoded_prompt}?model={model}&image={encoded_image}&nologo=true"
-    poll_headers = {"Authorization": f"Bearer {POLLINATIONS_API_KEY}"}
+    # این مدل با عکس کوچیک بهتر و سریع‌تر کار می‌کنه؛ ابعاد باید مضرب ۸ باشن
+    img = Image.open(io.BytesIO(resized_bytes)).convert("RGB")
+    img.thumbnail((512, 512))
+    w, h = img.size
+    img = img.crop((0, 0, max(8, w - w % 8), max(8, h - h % 8)))
+    buf = io.BytesIO()
+    img.save(buf, format="PNG")
+    small_b64 = base64.b64encode(buf.getvalue()).decode("utf-8")
 
-    res = requests.get(url, headers=poll_headers, timeout=60)
+    url = f"https://api.cloudflare.com/client/v4/accounts/{CF_ACCOUNT_ID}/ai/run/{model}"
+    payload = {
+        "prompt": prompt,
+        "image_b64": small_b64,
+        "strength": strength,
+        "num_steps": 20,
+        "guidance": 7.5,
+    }
+    res = requests.post(url, headers=headers, json=payload, timeout=90)
     content_type = res.headers.get("content-type", "")
     if res.status_code == 200 and content_type.startswith("image/"):
-        encoded = base64.b64encode(res.content).decode("utf-8")
-        return f"data:image/png;base64,{encoded}", None
+        return "data:image/png;base64," + base64.b64encode(res.content).decode("utf-8"), None
     return None, f"کد {res.status_code}: {res.text[:200]}"
 
 
 _IMG2IMG_HANDLERS = {
     "sensenova": _try_sensenova_model,
-    "pollinations": _try_pollinations_model,
+    "cloudflare": _try_cloudflare_img2img,
 }
 
 
-# ---- تغییر رنگ محلی (بدون هوش مصنوعی) ----
-COLOR_NAMES = {
-    "سفید": (255, 255, 255),
-    "سیاه": (0, 0, 0),
-    "قرمز": (255, 0, 0),
-    "آبی": (0, 90, 255),
-    "سبز": (0, 170, 60),
-    "زرد": (255, 220, 0),
-    "نارنجی": (255, 140, 0),
-    "بنفش": (130, 60, 220),
-    "صورتی": (255, 105, 180),
-    "طلایی": (212, 175, 55),
-    "خاکستری": (128, 128, 128),
-}
-
-
-def parse_color_request(text):
-    """رنگ‌های ذکرشده در متن رو به ترتیب پیدا می‌کنه. برمی‌گردونه: (source_rgb یا None, target_rgb) یا None"""
-    found = []
-    for name in COLOR_NAMES:
-        for m in re.finditer(name, text):
-            found.append((m.start(), name))
-    if not found:
-        return None
-    found.sort()
-    names = [n for _, n in found]
-    if len(names) >= 2 and names[0] != names[-1]:
-        return COLOR_NAMES[names[0]], COLOR_NAMES[names[-1]]
-    return None, COLOR_NAMES[names[-1]]
-
-
-def recolor_image(image_data_url, text, tolerance=80):
-    """
-    رنگ یک ناحیه‌ی تصویر رو عوض می‌کنه (جایگزینی رنگ با لبه‌های نرم).
-    - اگه کاربر دو رنگ گفته («سفید رو قرمز کن»): اولی مبدأ، آخری مقصد
-    - اگه یک رنگ گفته («قرمز کن»): مقصد اونه؛ مبدأ خودکار پیدا می‌شه
-      (پیش‌زمینه = رنگ کم‌حجم‌تر، و اگه نوشته «پس‌زمینه» = رنگ پرحجم‌تر)
-    برمی‌گردونه: (data_url, error). اگه دستور قابل‌فهم نبود: (None, None)
-    """
-    import numpy as np
-
-    parsed = parse_color_request(text)
-    if not parsed:
-        return None, None
-    source_rgb, target_rgb = parsed
-
-    try:
-        b64_data = image_data_url.split(",", 1)[1]
-        img = Image.open(io.BytesIO(base64.b64decode(b64_data))).convert("RGB")
-        img.thumbnail((2048, 2048))
-
-        if source_rgb is None:
-            q = img.quantize(colors=2)
-            counts = sorted(q.getcolors(), reverse=True)  # [(تعداد, اندیس), ...]
-            palette = q.getpalette()
-            want_background = "پس‌زمینه" in text or "پس زمینه" in text or "پسزمینه" in text
-            idx = counts[0][1] if (want_background or len(counts) == 1) else counts[-1][1]
-            source_rgb = tuple(palette[idx * 3: idx * 3 + 3])
-
-        arr = np.asarray(img).astype(np.float32)
-        src = np.array(source_rgb, dtype=np.float32)
-        dst = np.array(target_rgb, dtype=np.float32)
-
-        dist = np.sqrt(((arr - src) ** 2).sum(axis=2))
-        # داخل ناحیه وزن ۱، در لبه‌ها کم‌کم صفر می‌شه (برای نرم موندن لبه‌ها)
-        weight = np.clip((tolerance - dist) / (tolerance * 0.6), 0, 1)[..., None]
-        out = np.clip(arr + weight * (dst - src), 0, 255).astype(np.uint8)
-
-        buf = io.BytesIO()
-        Image.fromarray(out).save(buf, format="PNG")
-        return "data:image/png;base64," + base64.b64encode(buf.getvalue()).decode("utf-8"), None
-    except Exception as e:
-        return None, f"خطا در تغییر رنگ: {str(e)}"
-
-
-def edit_image(image_data_url, prompt):
+def edit_image(image_data_url, prompt, strength=0.65):
     """
     یه عکس ورودی رو طبق یه دستور متنی تغییر می‌ده.
     به‌ترتیب چند مدل مختلف رو امتحان می‌کنه؛ هر کدوم خطا داد، میره سراغ بعدی.
     برمی‌گردونه: (image_url, error)
     """
-    if not CF_ACCOUNT_ID or not CF_API_TOKEN:
-        return None, "قابلیت ویرایش عکس هنوز روی سرور فعال نشده (کلید Cloudflare تنظیم نشده)."
-
     # کوچیک کردن عکس قبل از ارسال تا حجم درخواست زیاد نشه
     try:
         b64_data = image_data_url.split(",", 1)[1]
@@ -518,7 +489,7 @@ def edit_image(image_data_url, prompt):
     for candidate in IMG2IMG_CANDIDATES:
         handler = _IMG2IMG_HANDLERS[candidate["kind"]]
         try:
-            image_url, err = handler(candidate["model"], resized_data_url, resized_bytes, prompt, headers)
+            image_url, err = handler(candidate["model"], resized_data_url, resized_bytes, prompt, headers, strength)
             if image_url:
                 return image_url, None
             errors_log.append(f"{candidate['model']}: {err}")
@@ -863,11 +834,15 @@ def chat_stream():
 
     if image_edit_requested:
         def edit_image_stream():
-            # اول تغییر رنگ محلی (سریع و دقیق)، اگه دستور رنگی نبود برو سراغ مدل‌های AI
-            img_url, err = recolor_image(image_data, user_message)
-            if not img_url and not err:
-                english_prompt = translate_to_image_prompt(user_message)
-                img_url, err = edit_image(image_data, english_prompt)
+            if is_grayscale_request(user_message):
+                img_url, err = make_grayscale(image_data)
+            else:
+                preset = match_style_preset(user_message)
+                if preset:
+                    english_prompt, strength = preset
+                else:
+                    english_prompt, strength = translate_to_image_prompt(user_message), 0.65
+                img_url, err = edit_image(image_data, english_prompt, strength)
             if err:
                 yield f"data: {json.dumps({'error': err})}\n\n"
             else:
