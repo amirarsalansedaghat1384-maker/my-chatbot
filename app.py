@@ -69,38 +69,35 @@ CF_ACCOUNT_ID = os.environ.get("CF_ACCOUNT_ID")
 CF_API_TOKEN = os.environ.get("CF_API_TOKEN")
 CF_IMAGE_MODEL = "@cf/black-forest-labs/flux-1-schnell"
 
-# ---- ویرایش عکس ----
-SENSENOVA_API_KEY = os.environ.get("SENSENOVA_API_KEY")
-CF_IMG2IMG_MODEL = "@cf/runwayml/stable-diffusion-v1-5-img2img"
+# ---- ویرایش عکس (سرویس سازگار با فرمت OpenAI، مثل Doona) ----
+# فقط IMAGE_EDIT_API_KEY لازمه؛ بقیه پیش‌فرض Doona دارن و اختیاری‌ان
+IMAGE_EDIT_BASE_URL = os.environ.get("IMAGE_EDIT_BASE_URL", "https://platform.doona.ai/v1")
+IMAGE_EDIT_API_KEY = os.environ.get("IMAGE_EDIT_API_KEY")
+IMAGE_EDIT_MODEL = os.environ.get("IMAGE_EDIT_MODEL", "gpt-image-2.5-flare")
+# کیفیت روی هزینه‌ی هر عکس اثر زیادی داره: low < medium < high (medium حدود ۱.۵ سنت)
+IMAGE_EDIT_QUALITY = os.environ.get("IMAGE_EDIT_QUALITY", "medium")
+# چون هر ویرایش پول واقعی مصرف می‌کنه، برای هر کاربر در روز سقف داریم
+MAX_DAILY_EDITS = int(os.environ.get("MAX_DAILY_EDITS", "5"))
 
-# زنجیره‌ی مدل‌های ویرایش عکس - اگه یکی خطا داد (یا اعتبارش تموم شد)، خودکار میره سراغ بعدی
-IMG2IMG_CANDIDATES = [
-    {"model": "sensenova-u1.5-lite", "kind": "sensenova"},  # رایگان (دوره بتا) - نیاز به SENSENOVA_API_KEY
-    {"model": CF_IMG2IMG_MODEL, "kind": "cloudflare"},  # رایگان - از همون کلید Cloudflare ساخت عکس استفاده می‌کنه
-]
+# اگه آدرس و کلید تنظیم نشده باشه، لیست خالیه و ویرایش عکس غیرفعال می‌مونه
+IMG2IMG_CANDIDATES = (
+    [{"model": IMAGE_EDIT_MODEL, "kind": "openai_compat"}]
+    if IMAGE_EDIT_BASE_URL and IMAGE_EDIT_API_KEY
+    else []
+)
 
 IMAGE_GEN_TRIGGERS = [
     "عکس بساز", "تصویر بساز", "یه عکس از", "یک عکس از", "عکسی از",
     "نقاشی بکش", "نقاشی کن", "برام بکش", "یه نقاشی از", "یک نقاشی از",
 ]
 
-# استایل‌های آماده برای ویرایش عکس: (کلمات کلیدی فارسی، پرامپت انگلیسی، قدرت تغییر بین ۰ تا ۱)
-STYLE_PRESETS = [
-    (["انیمه", "انیمیشن ژاپنی", "مانگا"],
-     "anime style illustration of the same person, same pose and composition, clean lineart, cel shading, vibrant colors, high quality", 0.65),
-    (["کارتون", "پیکسار", "انیمیشنی"],
-     "cartoon style illustration of the same person, same pose and composition, smooth shading, bold outlines, vibrant colors, 3d animated movie look", 0.65),
-    (["آبرنگ"],
-     "watercolor painting of the same scene, soft washes, paper texture, delicate brush strokes", 0.7),
-    (["رنگ روغن", "نقاشی"],
-     "oil painting of the same scene, visible brush strokes, rich colors, artistic, detailed canvas texture", 0.65),
-    (["اسکچ", "طراحی", "مدادی", "سیاه قلم"],
-     "pencil sketch of the same scene, graphite drawing, detailed hand-drawn lines, shading on white paper", 0.75),
-    (["پیکسل"],
-     "pixel art version of the same scene, 16-bit retro game style, limited color palette", 0.75),
+IMAGE_EDIT_TRIGGERS = [
+    "تغییر", "تبدیل", "ویرایش", "عوض", "رنگی", "رنگیش",
 ]
-IMAGE_EDIT_VERBS = ["کن", "بکن", "بساز", "بشه", "تبدیل", "تغییر", "ویرایش", "عوض", "بکش"]
-GRAYSCALE_WORDS = ["سیاه سفید", "سیاه و سفید", "سیاه‌وسفید", "سیاه‌ و‌ سفید", "خاکستری"]
+# الگوهایی مثل «... رو سفید کن»، «... رو قرمز کن» و غیره
+IMAGE_EDIT_COLOR_PATTERN = re.compile(
+    r"(سفید|سیاه|قرمز|آبی|سبز|زرد|نارنجی|بنفش|صورتی|طلایی|خاکستری)\s*(ش)?\s*کن"
+)
 
 SYSTEM_PROMPT = (
     "تو یک دستیار هوش مصنوعی فارسی‌زبان هستی. همیشه فقط و فقط به زبان فارسی روان و "
@@ -310,41 +307,13 @@ def detect_image_generation_request(text):
 
 
 def detect_image_edit_request(text):
-    """اگه پیام کاربر (همراه با یه عکس آپلودشده) درخواست تغییر استایل اون عکس بود، True برمی‌گردونه"""
-    has_verb = any(v in text for v in IMAGE_EDIT_VERBS)
-    if not has_verb:
-        return False
-    if any(w in text for w in GRAYSCALE_WORDS):
-        return True
-    for keywords, _prompt, _strength in STYLE_PRESETS:
-        if any(k in text for k in keywords):
+    """اگه پیام کاربر (همراه با یه عکس آپلودشده) درخواست تغییر/ویرایش اون عکس بود، True برمی‌گردونه"""
+    for trig in IMAGE_EDIT_TRIGGERS:
+        if trig in text:
             return True
+    if IMAGE_EDIT_COLOR_PATTERN.search(text):
+        return True
     return False
-
-
-def match_style_preset(text):
-    """اگه استایل آماده‌ای تو متن بود (prompt, strength) برمی‌گردونه، وگرنه None"""
-    for keywords, prompt, strength in STYLE_PRESETS:
-        if any(k in text for k in keywords):
-            return prompt, strength
-    return None
-
-
-def is_grayscale_request(text):
-    return any(w in text for w in GRAYSCALE_WORDS)
-
-
-def make_grayscale(image_data_url):
-    """عکس رو سیاه‌وسفید می‌کنه (بدون هوش مصنوعی، فوری و دقیق). برمی‌گردونه: (data_url, error)"""
-    try:
-        b64_data = image_data_url.split(",", 1)[1]
-        img = Image.open(io.BytesIO(base64.b64decode(b64_data))).convert("L")
-        img.thumbnail((2048, 2048))
-        buf = io.BytesIO()
-        img.save(buf, format="PNG")
-        return "data:image/png;base64," + base64.b64encode(buf.getvalue()).decode("utf-8"), None
-    except Exception as e:
-        return None, f"خطا در سیاه‌وسفید کردن عکس: {str(e)}"
 
 
 def translate_to_image_prompt(persian_text):
@@ -399,17 +368,15 @@ def generate_image(prompt):
         return None, f"خطا در ارتباط با سرویس ساخت عکس: {str(e)}"
 
 
-def _try_sensenova_model(model, resized_data_url, resized_bytes, prompt, headers, strength=0.65):
-    """ویرایش عکس با SenseNova (سازگار با فرمت images/edits اوپن‌ای‌آی، سرور بین‌المللی)"""
-    if not SENSENOVA_API_KEY:
-        return None, "کلید SenseNova روی سرور تنظیم نشده"
-
-    url = "https://token.sensenova.ai/v1/images/edits"
-    sn_headers = {"Authorization": f"Bearer {SENSENOVA_API_KEY}"}
+def _try_openai_compat_edit(model, resized_data_url, resized_bytes, prompt, headers):
+    """ویرایش عکس با هر سرویسی که فرمت استاندارد OpenAI یعنی POST {base}/images/edits رو داره (مثل Doona)"""
+    base = (IMAGE_EDIT_BASE_URL or "").rstrip("/")
+    url = f"{base}/images/edits"
+    auth = {"Authorization": f"Bearer {IMAGE_EDIT_API_KEY}"}
     files = {"image": ("image.png", resized_bytes, "image/png")}
-    data = {"prompt": prompt, "model": model}
+    data = {"model": model, "prompt": prompt, "quality": IMAGE_EDIT_QUALITY, "size": "auto"}
 
-    res = requests.post(url, headers=sn_headers, files=files, data=data, timeout=60)
+    res = requests.post(url, headers=auth, files=files, data=data, timeout=180)
     try:
         result = res.json()
     except Exception:
@@ -424,51 +391,41 @@ def _try_sensenova_model(model, resized_data_url, resized_bytes, prompt, headers
             return item["url"], None
 
     err = result.get("error", {})
-    msg = err.get("message", str(result)[:200]) if isinstance(err, dict) else str(result)[:200]
-    return None, msg
-
-
-def _try_cloudflare_img2img(model, resized_data_url, resized_bytes, prompt, headers, strength=0.65):
-    """تبدیل استایل عکس با Stable Diffusion img2img روی Cloudflare Workers AI"""
-    if not CF_ACCOUNT_ID or not CF_API_TOKEN:
-        return None, "کلید Cloudflare روی سرور تنظیم نشده"
-
-    # این مدل با عکس کوچیک بهتر و سریع‌تر کار می‌کنه؛ ابعاد باید مضرب ۸ باشن
-    img = Image.open(io.BytesIO(resized_bytes)).convert("RGB")
-    img.thumbnail((512, 512))
-    w, h = img.size
-    img = img.crop((0, 0, max(8, w - w % 8), max(8, h - h % 8)))
-    buf = io.BytesIO()
-    img.save(buf, format="PNG")
-    small_b64 = base64.b64encode(buf.getvalue()).decode("utf-8")
-
-    url = f"https://api.cloudflare.com/client/v4/accounts/{CF_ACCOUNT_ID}/ai/run/{model}"
-    payload = {
-        "prompt": prompt,
-        "image_b64": small_b64,
-        "strength": strength,
-        "num_steps": 20,
-        "guidance": 7.5,
-    }
-    res = requests.post(url, headers=headers, json=payload, timeout=90)
-    content_type = res.headers.get("content-type", "")
-    if res.status_code == 200 and content_type.startswith("image/"):
-        return "data:image/png;base64," + base64.b64encode(res.content).decode("utf-8"), None
-    return None, f"کد {res.status_code}: {res.text[:200]}"
+    msg = err.get("message", str(result)[:300]) if isinstance(err, dict) else str(err or result)[:300]
+    return None, f"کد {res.status_code}: {msg}"
 
 
 _IMG2IMG_HANDLERS = {
-    "sensenova": _try_sensenova_model,
-    "cloudflare": _try_cloudflare_img2img,
+    "openai_compat": _try_openai_compat_edit,
 }
 
 
-def edit_image(image_data_url, prompt, strength=0.65):
+def check_and_increment_edit_usage(user_entry):
+    """سقف روزانه‌ی ویرایش عکس برای هر کاربر (چون هر ویرایش هزینه‌ی واقعی داره)"""
+    today = datetime.date.today().isoformat()
+    usage = user_entry.setdefault("edit_usage", {"date": today, "count": 0})
+    if usage["date"] != today:
+        usage["date"] = today
+        usage["count"] = 0
+    if usage["count"] >= MAX_DAILY_EDITS:
+        return False
+    usage["count"] += 1
+    save_data(data_store)
+    return True
+
+
+def edit_image(image_data_url, prompt):
     """
     یه عکس ورودی رو طبق یه دستور متنی تغییر می‌ده.
     به‌ترتیب چند مدل مختلف رو امتحان می‌کنه؛ هر کدوم خطا داد، میره سراغ بعدی.
     برمی‌گردونه: (image_url, error)
     """
+    if not IMG2IMG_CANDIDATES:
+        return None, (
+            "قابلیت ویرایش عکس هنوز روی سرور فعال نشده (متغیر IMAGE_EDIT_API_KEY تنظیم نشده). "
+            "ساخت عکس از صفر همچنان کار می‌کنه."
+        )
+
     # کوچیک کردن عکس قبل از ارسال تا حجم درخواست زیاد نشه
     try:
         b64_data = image_data_url.split(",", 1)[1]
@@ -483,13 +440,11 @@ def edit_image(image_data_url, prompt, strength=0.65):
     except Exception as e:
         return None, f"خطا در پردازش عکس ورودی: {str(e)}"
 
-    headers = {"Authorization": f"Bearer {CF_API_TOKEN}", "content-type": "application/json"}
-
     errors_log = []
     for candidate in IMG2IMG_CANDIDATES:
         handler = _IMG2IMG_HANDLERS[candidate["kind"]]
         try:
-            image_url, err = handler(candidate["model"], resized_data_url, resized_bytes, prompt, headers, strength)
+            image_url, err = handler(candidate["model"], resized_data_url, resized_bytes, prompt, None)
             if image_url:
                 return image_url, None
             errors_log.append(f"{candidate['model']}: {err}")
@@ -834,15 +789,12 @@ def chat_stream():
 
     if image_edit_requested:
         def edit_image_stream():
-            if is_grayscale_request(user_message):
-                img_url, err = make_grayscale(image_data)
-            else:
-                preset = match_style_preset(user_message)
-                if preset:
-                    english_prompt, strength = preset
-                else:
-                    english_prompt, strength = translate_to_image_prompt(user_message), 0.65
-                img_url, err = edit_image(image_data, english_prompt, strength)
+            if IMG2IMG_CANDIDATES and not check_and_increment_edit_usage(user_entry):
+                yield f"data: {json.dumps({'error': f'سقف ویرایش عکس امروزت ({MAX_DAILY_EDITS} تا) تموم شد. فردا دوباره امتحان کن.'})}\n\n"
+                yield f"data: {json.dumps({'done': True, 'chat_id': chat_id})}\n\n"
+                return
+            english_prompt = translate_to_image_prompt(user_message)
+            img_url, err = edit_image(image_data, english_prompt)
             if err:
                 yield f"data: {json.dumps({'error': err})}\n\n"
             else:
